@@ -34,6 +34,7 @@ the stock path. Off unless DS4_SPEC=1.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -50,19 +51,84 @@ class _NotReady(Exception):
     """Raised before any model call, so falling back is safe."""
 
 
+# Cycle accounting, so a disappointing speedup can be attributed: low draft
+# acceptance is a different problem from rollback clamping it away.
+STATS = {"cycles": 0, "raw_accepted": 0, "clamped_accepted": 0, "clamp_hits": 0,
+         "restore_replay": 0}
+
+
+def stats_summary() -> str:
+    c = STATS["cycles"]
+    if not c:
+        return "no speculative cycles"
+    return (
+        f"cycles={c} "
+        f"raw_accept={STATS['raw_accepted'] / c:.2f} "
+        f"after_clamp={STATS['clamped_accepted'] / c:.2f} "
+        f"tokens/cycle={(STATS['clamped_accepted'] + c) / c:.2f} "
+        f"clamped_on={STATS['clamp_hits'] / c * 100:.0f}% "
+        f"restore_replay={STATS['restore_replay'] / c * 100:.0f}%"
+    )
+
+
+_logger = logging.getLogger("omlx.ds4")
+
+
 def _log(msg: str) -> None:
+    # Both: stderr for CLI runs, and the logging module so messages reach
+    # ~/.omlx/logs/server.log when oMLX is launched from the GUI (whose stderr
+    # goes nowhere visible).
     print(f"[ds4] {msg}", file=sys.stderr)
+    try:
+        _logger.info(msg)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def enabled() -> bool:
-    return os.environ.get("DS4_SPEC", "0") == "1"
+    """On when DS4_SPEC=1, or when the marker file exists.
+
+    The file matters because oMLX is normally launched from the GUI, which does
+    not inherit a shell's environment. Deliberately NOT gated on oMLX's own
+    `mtp_enabled`: that flag makes `is_mtp_active()` true, which builds oMLX's
+    V3-shaped MTP heads and fails the weight load outright (3140 unmatched
+    tensors) on this DSpark checkpoint.
+
+        enable :  touch ~/.omlx/ds4_spec_enabled   (then restart oMLX)
+        disable:  rm    ~/.omlx/ds4_spec_enabled
+    """
+    if os.environ.get("DS4_SPEC") == "1":
+        return True
+    if os.environ.get("DS4_SPEC") == "0":
+        return False
+    return (Path.home() / ".omlx" / "ds4_spec_enabled").exists()
 
 
 def _block_size() -> int:
+    """Draft tokens per cycle. Measured on M3 Ultra, 200 tokens, after the
+    rollback was fixed (earlier numbers were taken against a corrupt cache and
+    were meaningless -- see `_snapshot`):
+
+        k=2  1.28x   raw_accept 1.49/2   clamped  0%   restore  0%
+        k=3  1.43x   raw_accept 2.01/3   clamped  0%   restore  0%   <- default
+        k=5  1.09x   raw_accept 2.41/5   clamped 25%   restore 20%
+        k=7  0.49x   raw_accept 1.65/7   clamped 50%   restore 32%
+
+    Two effects push the optimum down to 3:
+
+    1. The drafter is trained at `dspark_block_size` = 5, and its block is
+       *non-causal* -- every draft position attends to every other. Padding past
+       the trained width puts out-of-distribution noise positions in view of all
+       the real ones, so accepted-prefix actually FALLS (2.41 at k=5 -> 1.65 at
+       k=7) even though there are more drafts to accept.
+    2. Above k=3 the PoolingCache rollback starts refusing, and each refusal
+       costs a full restore plus a replay forward. At k=5 that is a fifth of all
+       cycles.
+    """
     try:
-        return int(os.environ.get("DS4_SPEC_BLOCK", "5"))
+        return int(os.environ.get("DS4_SPEC_BLOCK", "3"))
     except ValueError:
-        return 5
+        return 3
 
 
 def _get_drafter(model) -> Optional[Any]:
@@ -111,17 +177,42 @@ def _get_drafter(model) -> Optional[Any]:
     return _DRAFTER
 
 
+_REPORTED = set()
+
+
 def _eligible(gb) -> bool:
     if not enabled():
         return False
-    if len(getattr(gb, "uids", []) or []) != 1:
-        return False
-    if any(getattr(gb, "logits_processors", None) or []):
-        return False
+
     model = gb.model
-    if getattr(model, "model_type", None) != "deepseek_v4":
+    checks = {
+        "single_sequence": len(getattr(gb, "uids", []) or []) == 1,
+        "no_logits_processors": not any(getattr(gb, "logits_processors", None) or []),
+        "is_deepseek_v4": getattr(model, "model_type", None) == "deepseek_v4",
+        # Rollback goes through oMLX's own helpers; without them there is no
+        # sound way to undo a rejected draft, so stay on the stock path.
+        "has_mtp_clamp_accept": hasattr(model, "mtp_clamp_accept"),
+        "has_mtp_partial_rollback": hasattr(model, "mtp_partial_rollback"),
+        "has_main_hidden": getattr(model.model, "main_hidden", None) is not None,
+    }
+    bad = [k for k, v in checks.items() if not v]
+
+    # oMLX's MTP patch is self-healing: it reinstalls its own
+    # DeepseekV4Model.__call__ whenever it sees ours, and in the server that
+    # happens during model load, i.e. after our boot hook has run. So heal back:
+    # if the capture is the only thing missing, re-wrap now and pick it up on
+    # the next forward. Costs one non-speculative step, then engages.
+    if bad == ["has_main_hidden"]:
+        _apply_hidden_capture()
         return False
-    return getattr(model.model, "main_hidden", None) is not None
+
+    if bad:
+        key = tuple(bad)
+        if key not in _REPORTED:
+            _REPORTED.add(key)
+            _log(f"speculation not engaging, failed: {', '.join(bad)}")
+        return False
+    return True
 
 
 def _trim_rotating(c, n: int) -> None:
@@ -139,6 +230,28 @@ def _trim_rotating(c, n: int) -> None:
     c.values = c.values[..., :-n, :]
     c.offset -= n
     c._idx = c.keys.shape[2]
+
+
+def _check_offsets(cache, expected: int, tag: str) -> None:
+    """Assert every rotating cache agrees on how many tokens are committed.
+
+    Layer desync is the mechanism behind the repetition garble: if one layer
+    holds more tokens than another, the attention mask is built for one length
+    and the keys are another, and the model decodes against phantom context.
+    Enable with DS4_SPEC_DEBUG=1.
+    """
+    if os.environ.get("DS4_SPEC_DEBUG") != "1":
+        return
+    seen = {}
+    for i, layer_cache in enumerate(cache):
+        for c in _unwrap(layer_cache):
+            if type(c).__name__.endswith("RotatingKVCache"):
+                seen.setdefault(int(c.offset), []).append(i)
+    if len(seen) > 1 or (seen and expected not in seen):
+        _log(
+            f"CACHE DESYNC after {tag}: expected offset {expected}, "
+            f"found {[(off, f'{len(ls)} layers') for off, ls in seen.items()]}"
+        )
 
 
 def _unwrap(layer_cache) -> list:
@@ -160,18 +273,112 @@ def _unwrap(layer_cache) -> list:
     return [layer_cache]
 
 
-def _rollback(cache, n: int) -> bool:
-    if n <= 0:
-        return True
+def _set_armed(flag: bool) -> None:
+    """Arm/disarm oMLX's rotating-cache undo stash around a verify forward."""
+    try:
+        from omlx.patches.mlx_lm_mtp.cache_rollback import set_undo_armed
+
+        set_undo_armed(flag)
+    except Exception:  # noqa: BLE001 -- absence just means no undo coverage
+        pass
+
+
+def _ensure_rollback_patch() -> None:
+    """Make oMLX's rollback machinery available.
+
+    Two separate patches:
+      * `cache_rollback.apply()` wraps RotatingKVCache with the armed undo log.
+      * the MTP model patch attaches `mtp_clamp_accept` / `mtp_partial_rollback`
+        to the Model class. Both are safe to apply with `mtp_enabled` off --
+        building the MTP heads is separately gated on `is_mtp_active()`, so this
+        adds the rollback helpers without changing how the model loads.
+    """
+    try:
+        from omlx.patches.mlx_lm_mtp import cache_rollback
+
+        cache_rollback.apply()
+    except Exception as e:  # noqa: BLE001
+        _log(f"cache_rollback not available: {type(e).__name__}: {e}")
+
+    try:
+        from omlx.patches.mlx_lm_mtp import deepseek_v4_model as mtp_model
+
+        mtp_model.apply()
+    except Exception as e:  # noqa: BLE001
+        _log(f"MTP model patch not available: {type(e).__name__}: {e}")
+
+
+def _snapshot(cache) -> list:
+    """Capture enough state to undo a verify forward exactly.
+
+    A multi-token update takes the *concat* path on both cache types, which
+    rebinds `keys`/`values`/`pooled` to fresh arrays rather than mutating them,
+    so holding the old references is a valid snapshot. `buf_kv`/`buf_gate` are
+    the exception -- `accumulate_windows` writes into them in place -- so those
+    get a real copy. They are only (B, ratio, D), so it is cheap.
+    """
+    snaps = []
     for layer_cache in cache:
         for c in _unwrap(layer_cache):
-            if type(c).__name__.endswith("RotatingKVCache"):
-                _trim_rotating(c, n)
+            state = {}
+            for key, value in vars(c).items():
+                if isinstance(value, mx.array):
+                    # DETACH. Several caches mutate arrays in place -- notably
+                    # BatchRotatingKVCache, whose `offset` is an mx.array, and
+                    # PoolingCache's `buf_kv` via setitem. A plain reference
+                    # would read back the post-update value, making the whole
+                    # snapshot a silent no-op. `+ 0` is lazy, so this costs a
+                    # graph node, not a copy, unless it is actually used.
+                    value = value + 0
+                state[key] = value
+            snaps.append((c, state))
+    return snaps
+
+
+def _restore(snaps) -> None:
+    """Put every cache back exactly as it was before the verify forward.
+
+    Snapshots the full instance dict rather than a hand-listed set of fields:
+    the cache classes differ in what they carry (`RotatingKVCache` has
+    keys/values/offset/_idx; `BatchRotatingKVCache` adds _offset/rotated/
+    left_padding; `PoolingCache` has pooled/remainder/buf_*/prev_win_*), and
+    missing one silently corrupts the rollback.
+    """
+    for c, state in snaps:
+        for key, value in state.items():
+            setattr(c, key, value)
+
+
+def _rollback(cache, n: int) -> bool:
+    """Trim `n` rejected positions. False means nothing was changed for some
+    cache and the caller must restore from a snapshot instead.
+
+    `PoolingCache.trim` refuses (returns 0, without mutating) when the replayed
+    prefix would complete a pool window, because it discards what
+    `accumulate_windows` hands back -- the window the Compressor still has to
+    compress into `pooled`. Measured: 36/40 rollbacks trim exactly, the other 4
+    are window-boundary crossings. Detect and fall back rather than corrupt.
+    """
+    if n <= 0:
+        return True
+    pending = []
+    for layer_cache in cache:
+        for c in _unwrap(layer_cache):
+            name = type(c).__name__
+            if name.endswith("RotatingKVCache"):
+                pending.append(("rot", c))
             elif hasattr(c, "trim"):
-                if c.trim(n) != n:
-                    return False
+                if not c.is_trimmable() or not c._can_undo(n):
+                    return False  # refuse before touching anything
+                pending.append(("other", c))
             else:
                 return False
+
+    for kind, c in pending:
+        if kind == "rot":
+            _trim_rotating(c, n)
+        elif c.trim(n) != n:
+            return False
     return True
 
 
@@ -188,11 +395,17 @@ def _apply_hidden_capture(n_last: int = 3) -> None:
     import mlx_lm.models.deepseek_v4 as dsv4
 
     cls = dsv4.DeepseekV4Model
-    if getattr(cls, "_ds4_hidden_patched", False):
+    # Check the *function*, not a class flag. oMLX's MTP patch is self-healing:
+    # it treats our wrapper as drift and reinstalls its own __call__, so a
+    # class-level "already patched" flag would stop us ever re-wrapping.
+    if getattr(cls.__call__, "_ds4_capture", False):
         return
     original = cls.__call__
 
-    def __call__(self, inputs, cache=None):
+    # *args/**kwargs, because oMLX's MTP patch gives this a wider signature
+    # (return_hidden, n_confirmed) than stock. Apply this AFTER that patch so we
+    # wrap it rather than replace it.
+    def __call__(self, inputs, *args, **kwargs):
         targets = set(
             range(self.args.num_hidden_layers - n_last, self.args.num_hidden_layers)
         )
@@ -201,22 +414,39 @@ def _apply_hidden_capture(n_last: int = 3) -> None:
         inner = layer_cls.__call__
         index_of = {id(layer): i for i, layer in enumerate(self.layers)}
 
-        def wrapper(layer_self, h, mask, c, ids):
-            out = inner(layer_self, h, mask, c, ids)
+        def wrapper(layer_self, *a, **kw):
+            out = inner(layer_self, *a, **kw)
             if index_of.get(id(layer_self)) in targets:
                 captured.append(out.mean(axis=2))
             return out
 
         layer_cls.__call__ = wrapper
         try:
-            out = original(self, inputs, cache)
+            out = original(self, inputs, *args, **kwargs)
         finally:
             layer_cls.__call__ = inner
-        self.main_hidden = (
-            mx.concatenate(captured, axis=-1) if len(captured) == n_last else None
-        )
+
+        if len(captured) == n_last:
+            self.main_hidden = mx.concatenate(captured, axis=-1)
+            # Keep the prompt's hidden separately. The drafter's window holds up
+            # to `sliding_window` main-model positions and is what gives its
+            # drafts context; seeding it from a single decode position instead
+            # of the whole prompt costs a lot of acceptance until it refills one
+            # token at a time. A verify is at most 8 wide, so anything wider is
+            # a prompt.
+            if inputs.shape[1] > 16:
+                self.main_hidden_prefill = self.main_hidden
+        else:
+            self.main_hidden = None
+            if not getattr(type(self), "_ds4_capture_warned", False):
+                type(self)._ds4_capture_warned = True
+                _log(
+                    f"hidden capture got {len(captured)} of {n_last} target layers "
+                    f"(num_hidden_layers={self.args.num_hidden_layers})"
+                )
         return out
 
+    __call__._ds4_capture = True
     cls.__call__ = __call__
     cls._ds4_hidden_patched = True
 
@@ -249,13 +479,25 @@ def _apply_path_capture() -> None:
 
 
 def apply() -> bool:
-    """Patch `GenerationBatch._step` with the speculative path."""
-    global _PATCHED
-    if _PATCHED:
-        return False
+    """Patch `GenerationBatch._step` with the speculative path.
 
+    The class-level patches run on EVERY call, not just the first: oMLX
+    re-registers `mlx_lm.models.deepseek_v4` from source on each model load, so
+    the classes are fresh objects and any patch applied to the previous ones is
+    gone. Each helper carries its own per-class idempotency guard, so repeating
+    them is free. Only the `GenerationBatch._step` patch is once-only —
+    `mlx_lm.generate` is never re-registered.
+    """
+    global _PATCHED
+
+    # Order matters: the MTP patch replaces DeepseekV4Model.__call__, so install
+    # it first and let the hidden capture wrap the result.
+    _ensure_rollback_patch()
     _apply_hidden_capture()
     _apply_path_capture()
+
+    if _PATCHED:
+        return False
 
     from mlx_lm.generate import GenerationBatch
 
@@ -321,12 +563,19 @@ def _cycle(self, drafter):
 
     window = getattr(self, "_ds4_window", None)
     if window is None:
-        # Seed from the prefill's hidden states; a short window only costs
+        # Seed from the *prompt's* hidden states where possible -- the drafter
+        # needs main-model context to draft well, and the last forward before
+        # the first cycle is a single decode step. A short window only costs
         # acceptance, never correctness.
         window = drafter.new_window(1)
-        mh = model.model.main_hidden
+        mh = getattr(model.model, "main_hidden_prefill", None)
+        if mh is None:
+            mh = model.model.main_hidden
+        mh = mh[:, -drafter.window_size :]
         start = max(0, offset - mh.shape[1])
         window = drafter.push_window(window, mh, start)
+        if os.environ.get("DS4_SPEC_DEBUG") == "1":
+            _log(f"window seeded with {mh.shape[1]} positions from offset {start}")
 
     draft_ids, _conf = drafter(
         mx.array([[t]]),
@@ -338,9 +587,26 @@ def _cycle(self, drafter):
     mx.eval(draft_ids)
     drafts = [int(x) for x in draft_ids[0].tolist()]
 
-    # Verify [t, d1..dk] in one forward.
-    cand = mx.array([[t] + drafts])
-    logits = model(cand, cache=cache)[0]  # (k+1, V)
+    # Verify [t, d1..dk] in one forward, with oMLX's undo log armed.
+    #
+    # cache_rollback wraps RotatingKVCache.update_and_fetch to stash a DETACHED
+    # snapshot (`v + 0` -- a plain reference would see the post-update value,
+    # which is the trap I fell into rolling my own) for any armed update of
+    # 2..8 tokens, and makes trim() replay the confirmed prefix from it. It is
+    # only armed around a verify forward, so stock decode keeps stock semantics.
+    # Snapshot before the forward. `mtp_clamp_accept` can return an accepted
+    # count that `mtp_partial_rollback` then refuses, and by that point the
+    # verify has already advanced the cache -- which is what turns output into
+    # repetition. This gives an unconditional way back.
+    snaps = _snapshot(cache)
+    _check_offsets(cache, offset, "pre-verify")
+
+    _set_armed(True)
+    try:
+        logits = model(cand_arr := mx.array([[t] + drafts]), cache=cache)[0]
+    finally:
+        _set_armed(False)
+    del cand_arr
     logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
     sampler = (self.samplers and self.samplers[0]) or self.fallback_sampler
@@ -352,14 +618,46 @@ def _cycle(self, drafter):
     while n < k and samples[n] == drafts[n]:
         n += 1
 
-    if not _rollback(cache, k - n):
-        raise RuntimeError("cache rollback unsupported")
+    # Not every accepted length is rollback-able: a PoolingCache can only replay
+    # a confirmed prefix that stays inside its window. `mtp_clamp_accept` finds
+    # the largest m <= n that every layer can undo. Emitting fewer drafts than
+    # were verified is always correct -- the rest are re-derived next cycle.
+    n_raw = n
+    n = int(model.mtp_clamp_accept(cache, n, k))
+    STATS["cycles"] += 1
+    STATS["raw_accepted"] += n_raw
+    STATS["clamped_accepted"] += n
+    STATS["clamp_hits"] += int(n != n_raw)
+
+    if n != n_raw and STATS["clamp_hits"] == 1:
+        # Leading indicator of the unsafe regime: once the clamp starts firing,
+        # `mtp_partial_rollback` can still refuse the value the clamp returned,
+        # and that refusal lands AFTER the verify forward -- rejected drafts
+        # stay in the cache and output degenerates into repetition. Measured
+        # clean at block_size <= 3; garbled at 7.
+        _log(
+            f"clamp fired (accept {n_raw}->{n}, block_size={k}). Output is only "
+            "verified clean where the clamp never fires; lower DS4_SPEC_BLOCK "
+            "if you see repetition."
+        )
+
+    if not model.mtp_partial_rollback(cache, n, k):
+        # Refused (possibly after partially trimming some layers). Restore the
+        # pre-verify state wholesale and re-run only the accepted tokens. The
+        # restore overwrites whatever the partial trim did, and the replay is
+        # the model itself, so the cache cannot disagree with the model.
+        STATS["restore_replay"] += 1
+        _restore(snaps)
+        _check_offsets(cache, offset, "restore")
+        model(mx.array([[t] + drafts[:n]]), cache=cache)
 
     # Emitted: t (already fed) then the n accepted drafts. `_next_tokens`
     # becomes the target's sample at the first unaccepted position.
     emitted = [(t, lp_prev)] + [(drafts[i], logprobs[i]) for i in range(n)]
     self._next_tokens = mx.array([samples[n]])
     self._next_logprobs = [logprobs[n]]
+
+    _check_offsets(cache, offset + n + 1, f"commit(n={n}/{k})")
 
     mh = model.model.main_hidden[:, : n + 1]
     for j in range(n + 1):

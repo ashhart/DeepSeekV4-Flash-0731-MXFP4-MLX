@@ -91,11 +91,19 @@ def blocked_window_attention(
         if pooled is not None:
             k_blk = mx.concatenate([k_blk, pooled], axis=2)
             pm = (
-                pooled_mask[i:j]
+                pooled_mask[..., i:j, :]
                 if pooled_mask is not None
                 else mx.ones((j - i, n_pooled), dtype=mx.bool_)
             )
-            m = mx.concatenate([m, pm], axis=1)
+            # `make_mask` can return a batched (B, L, P) mask while the band mask
+            # is (L, K). Lift whichever is lower-rank instead of assuming either:
+            # mismatched ranks throw, and it only surfaces once the pooled cache
+            # is non-empty, i.e. on long prompts.
+            while pm.ndim > m.ndim:
+                m = m[None]
+            while m.ndim > pm.ndim:
+                pm = pm[None]
+            m = mx.concatenate([m, pm], axis=-1)
 
         outs.append(
             scaled_dot_product_attention(

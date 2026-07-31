@@ -63,12 +63,18 @@ def main() -> int:
         trim_rotating(c, 3)  # rejected 3 of 5 drafts
         show("after trim(3)", c)
 
+        # Build the mask the way the model does: BEFORE the update, from the
+        # cache itself. That ordering is the whole point -- make_mask has to
+        # predict the post-update key count.
+        from mlx_lm.models.base import create_attention_mask
+
+        mask = create_attention_mask(
+            mx.zeros((1, 1, HEAD_DIM)), c, window_size=MAX, return_array=True
+        )
         k, _ = c.update_and_fetch(kv(1), kv(1))
         show("after next decode step", c)
-        print(f"   fetched keys = {k.shape[2]}")
-
-        mask_w = min(c.offset, MAX)
-        print(f"   model would build mask width ~{mask_w} vs fetched {k.shape[2]}"
+        mask_w = mask.shape[-1] if hasattr(mask, "shape") else None
+        print(f"   fetched keys = {k.shape[2]}, real mask width = {mask_w}"
               f"   {'MISMATCH' if mask_w != k.shape[2] else 'ok'}")
     return 0
 

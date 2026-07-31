@@ -62,8 +62,9 @@ Accepted prefix out of 5 drafts:
 | structured code | 100% | 96% | 96% | 92% | 96% | **4.75** | 5.75 |
 | open-ended prose | 71% | 21% | 8% | 17% | 8% | 1.00 | 2.00 |
 
-A 6-token verify costs ~1.80x one decode step, so the ceiling on code would be
-~2.76x — but that is a projection, not a measurement, until rollback is fixed.
+A 6-token verify costs ~1.80x one decode step. That acceptance was measured at
+the drafter's trained width on clean code; in the generation loop against mixed
+chat content it runs lower (~2.0/3), which is what the table above reflects.
 
 ---
 
@@ -161,35 +162,28 @@ python3 tools/audit_quant.py ~/.omlx/models/Vontra/DeepSeek-V4-Flash-0731-MXFP4-
 
 ## DSpark speculative decoding
 
-**Status: architecture ported and verified, throughput NOT yet usable.**
+**Working and opt-in.** Enable with a marker file, then restart oMLX:
 
-The drafter loads clean (115/115 tensors, 0 missing, 0 unexpected, 0 shape
-mismatches) and its acceptance is measured and high. What is not solved is
-rolling rejected drafts back out of the KV cache:
+```sh
+touch ~/.omlx/ds4_spec_enabled     # on
+rm    ~/.omlx/ds4_spec_enabled     # off
+pkill -f 'oMLX|omlx-server'; open -a oMLX
+```
 
-- `RotatingKVCache` — solved. `is_trimmable()` is False once rotated, but a
-  verify has S>1 which always takes `_update_concat`, and that rebinds
-  `keys`/`values` in temporal order, so the rejected tail can be sliced off
-  (`_trim_rotating`).
-- `CacheList` — was silently skipped, because it is **not** a `list` subclass;
-  an `isinstance(x, (list, tuple))` check misses it. Fixed by unwrapping
-  `.caches`.
-- `PoolingCache` — **unsolved.** `trim(n)` only succeeds when the rejected
-  tokens are still in the un-pooled remainder buffer, or a *one-update* undo log
-  covers them. A 5-draft verify routinely crosses a pooling boundary, so it
-  returns 0 and the compressed layers keep the rejected drafts.
+Tune the draft width with `DS4_SPEC_BLOCK` (default 3). Confirm it engaged:
 
-Until that last one is fixed, speculation corrupts the caches of the 41
-compressed layers. The output still *looks* plausible — rejected drafts are, by
-construction, plausible continuations — which is precisely why the earlier
-throughput number went unchallenged. Treat any speculative speedup as unproven.
+```sh
+grep omlx.ds4 ~/.omlx/logs/server.log
+```
 
-Fix path: give `PoolingCache` a multi-update undo log. It already stores the
-update's `kv`/`gate` and replays the confirmed prefix via `accumulate_windows`;
-the `_can_undo` guard (`undo[2] + k < ratio`) is what blocks k>1.
+> Do **not** use oMLX's own `mtp_enabled` toggle for this model. That builds
+> oMLX's DeepSeek-**V3**-shaped MTP heads (`e_proj`/`h_proj`) and fails the weight
+> load outright with 3140 unmatched tensors. `dflash_enabled` needs a trained
+> draft checkpoint that does not exist for this target.
 
-The checkpoint ships DSpark under `mtp.*` — three *heterogeneous* stages, not the
-DeepSeek-V3 MTP head:
+### What the checkpoint actually ships
+
+DSpark lives under `mtp.*` as three *heterogeneous* stages, not the V3 MTP head:
 
 - `mtp.0` — `main_proj` (`3*dim -> dim`, fusing hidden states from layers
   40/41/42 per `dspark_target_layer_ids`) + `main_norm`, then a block
@@ -198,54 +192,79 @@ DeepSeek-V3 MTP head:
   `confidence_head`
 
 `config.json` says `num_nextn_predict_layers: 1`; `inference/config.json` in the
-checkpoint has it right as `n_mtp_layers: 3`. Anything built for the V3 head
-(`e_proj`/`h_proj`, `enorm`/`hnorm`) will not load it.
+checkpoint has it right as `n_mtp_layers: 3`.
 
-The reason it is fast: the drafter is **not autoregressive**. All 5 draft
-positions run in one forward — position 0 holds the real token, positions 1-4 a
-fixed noise token, with real context arriving via `main_x` in the KV cache. Every
-query position gets the same index set, so there is no causal mask inside the
-block. Token-to-token dependency is added afterwards by the cheap Markov bigram
-prior.
+The reason it is fast: the drafter is **not autoregressive**. All draft positions
+run in one forward — position 0 holds the real token, the rest a fixed noise
+token, with real context arriving via `main_x` in the KV cache. Every query
+position gets the same index set, so there is no causal mask inside the block.
+Token-to-token dependency is added afterwards by the cheap Markov bigram prior.
+That same non-causality is why drafting wider than the trained width backfires.
+
+### The rollback bug (worth reading if you build on this)
+
+Rejected drafts must come back out of the KV cache. Getting that wrong does not
+crash — it produces fluent repetition ("The user id. The user id. ...") while
+throughput *looks* great, because a rejected draft is a plausible continuation.
+Three distinct traps, all hit here:
+
+1. **`CacheList` is not a `list` subclass** — it wraps `.caches`. An
+   `isinstance(x, (list, tuple))` check silently skips every compressed layer.
+2. **Snapshots must be detached.** The server uses `BatchRotatingKVCache`, whose
+   `offset` is an `mx.array` **mutated in place**; a plain reference reads back
+   the *post*-update value, making the snapshot a no-op. oMLX's own
+   `cache_rollback` does `v = v + 0` for exactly this. Snapshot the whole
+   instance dict, not a hand-listed set of fields.
+3. **oMLX's MTP patch is self-healing** — it reinstalls its own
+   `DeepseekV4Model.__call__` whenever it sees a foreign one, during model load.
+   A class-level "already patched" flag therefore never re-wraps; mark the
+   function instead. oMLX also re-registers `mlx_lm.models.deepseek_v4` from
+   source per load, so class patches must be re-applied every time.
+
+Rollback itself goes through oMLX's own tested helpers — `mtp_clamp_accept`
+(reduce accepted until every layer can undo), `mtp_partial_rollback`, and the
+armed undo log (`set_undo_armed`, covering updates of 2..8 tokens). Do not
+hand-roll these; they already exist and are correct.
+
+`tools/cache_invariants.py` and `tools/pooling_rollback_test.py` reproduce the
+cache behaviour with no model load.
+
+### Standalone scripts
 
 ```sh
 # acceptance on your own content
 python3 ds4/acceptance.py <model_dir> --prompt "$(cat some_file.py)"
 
-# end-to-end speculative decode vs greedy baseline
-python3 ds4/spec_decode.py <model_dir> --max-tokens 192 --baseline
+# through the real BatchGenerator, hook off vs on
+python3 ds4/bench_engine.py <model_dir> --max-tokens 200
 ```
 
-Scripts must run under oMLX's bundled interpreter — see
-[`RUNNING.md`](RUNNING.md).
+See [`RUNNING.md`](RUNNING.md).
 
 ### On exactness
 
-Speculative output is **not** token-identical to greedy, and this is not a bug in
-the rollback. `ds4/check_exactness.py` feeds identical tokens down both paths
+Speculative output is **not** token-identical to greedy, and that is not a
+rollback bug. `ds4/check_exactness.py` feeds identical tokens down both paths
 (teacher-forced, no drift):
 
 ```
 max |logit diff| : 1.89     argmax agreement : 5/6
 ```
 
-Layer-by-layer, the divergence is exactly `0.00391` (= 2^-8, one bf16 ULP)
-through layers 0-4, then jumps 10x at the first layer where a top-k decision
-flips. A k-token forward reassociates the same matmuls differently than k
-single-token steps; 1 ULP is enough to flip which of 256 experts the router
-picks. Batching the verify *is* speculative decoding, so this is unavoidable —
-vLLM on DGX Spark has the same property.
-
-It is not a correctness defect: every committed token comes from the verify
-pass's own argmax, so the output is a sound greedy decode, just not the same
-greedy path.
-
----
+Layer by layer the divergence is exactly `0.00391` (= 2^-8, one bf16 ULP) through
+layers 0-4, then jumps 10x at the first layer where a top-k decision flips. A
+k-token forward reassociates the same matmuls differently than k single-token
+steps, and 1 ULP is enough to flip which of 256 experts the router picks.
+Batching the verify *is* speculative decoding, so this is unavoidable — vLLM on
+DGX Spark has the same property. Every committed token still comes from the
+verify pass's own argmax, so the output is a sound greedy decode, just not the
+same greedy path.
 
 ## Layout
 
 ```
-ds4/windowed_prefill.py   blocked prefill attention (the auto-applied patch)
+ds4/windowed_prefill.py   blocked prefill attention (auto-applied)
+ds4/engine_hook.py        speculative decoding wired into GenerationBatch._step
 ds4/boot.py               sys.meta_path hook installed by the .pth
 ds4/dspark_mlx.py         DSpark drafter: 3 stages, markov + confidence heads
 ds4/load_dspark.py        maps mtp.* checkpoint tensors onto the drafter
@@ -257,6 +276,8 @@ tools/audit_quant.py      ground truth from safetensors headers
 tools/bench_windowed.py   dense vs windowed prefill
 tools/server_prefill.py   prefill through the oMLX HTTP API
 tools/multitoken_cost.py  cost of a k-token verify
+tools/cache_invariants.py RotatingKVCache trim behaviour, no model load
+tools/pooling_rollback_test.py  PoolingCache rollback exactness, no model load
 ```
 
 ## Credits

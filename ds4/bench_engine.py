@@ -56,6 +56,8 @@ def main() -> int:
     ap.add_argument("model_dir")
     ap.add_argument("--max-tokens", type=int, default=160)
     ap.add_argument("--prompt", default="Write a Python class implementing an LRU cache with get and put.")
+    ap.add_argument("--context-file", default=None, help="prepend a file, to test long context")
+    ap.add_argument("--context-chars", type=int, default=80000)
     args = ap.parse_args()
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -72,10 +74,26 @@ def main() -> int:
     engine_hook.apply()
 
     model, _ = load_model(Path(args.model_dir))
+    # oMLX re-registers the deepseek_v4 module during load, so re-apply the
+    # class-level patches against the classes the model was actually built from.
+    windowed_prefill.apply()
+    engine_hook.apply()
     model._ds4_model_path = str(args.model_dir)
     mx.eval(model.parameters())
     tokenizer = load_tokenizer(Path(args.model_dir))
-    prompt_ids = tokenizer.encode(args.prompt)
+
+    # Apply the chat template. Without it the model does freeform completion,
+    # which is far higher entropy than real traffic and understates acceptance.
+    text = args.prompt
+    if args.context_file:
+        text = Path(args.context_file).read_text()[: args.context_chars] + "\n\n" + text
+    try:
+        prompt_ids = tokenizer.apply_chat_template(
+            [{"role": "user", "content": text}], add_generation_prompt=True
+        )
+    except Exception:  # noqa: BLE001
+        prompt_ids = tokenizer.encode(text)
+    print(f"prompt tokens: {len(prompt_ids)}")
 
     print(f"loaded; resident {mx.get_active_memory() / 1024**3:.1f} GiB\n")
 
@@ -85,6 +103,7 @@ def main() -> int:
     spec_out, spec_tps, spec_n = run(model, tokenizer, prompt_ids, args.max_tokens, True)
     print(f"hook on  : {spec_tps:6.1f} tok/s over {spec_n} tokens   "
           f"({spec_tps / base_tps:.2f}x)")
+    print(f"           {engine_hook.stats_summary()}")
 
     same = base_out[: min(len(base_out), len(spec_out))] == spec_out[: min(len(base_out), len(spec_out))]
     print(f"\nsame tokens: {same}")

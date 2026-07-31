@@ -40,7 +40,12 @@ for cls in ("LocalAttention", "CompressedAttention"):
     got = getattr(d, cls).__call__.__qualname__
     assert "apply.<locals>" in got, f"{cls} not patched (got {got})"
     print(f"  {cls:<22} -> {got}")
+from ds4 import engine_hook
+engine_hook.apply()
+assert hasattr(d.Model, "mtp_clamp_accept"), "oMLX rollback helpers missing"
 print("OK: windowed prefill is active")
+print(f"speculative decoding: {'ON' if engine_hook.enabled() else 'off'}"
+      f"  (toggle: ~/.omlx/ds4_spec_enabled)")
 EOF
     exit 0
     ;;
