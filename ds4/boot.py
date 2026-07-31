@@ -44,6 +44,15 @@ def _install_patches(module) -> None:
                 )
         except Exception as e:  # noqa: BLE001 -- never break model loading
             _log(f"windowed prefill NOT applied: {type(e).__name__}: {e}")
+
+        try:
+            from ds4 import engine_hook
+
+            if engine_hook.apply():
+                state = "ON" if engine_hook.enabled() else "off (set DS4_SPEC=1)"
+                _log(f"DSpark speculative decoding hook installed, {state}")
+        except Exception as e:  # noqa: BLE001
+            _log(f"DSpark hook NOT installed: {type(e).__name__}: {e}")
         return result
 
     wrapped._ds4_wrapped = True

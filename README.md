@@ -15,7 +15,9 @@ Three things live here:
    even though `sliding_window` is 128, making prefill quadratic. Blocking the
    queries removes that. **Prefill stops degrading with context length.**
 3. **A DSpark speculative decoder.** The checkpoint ships a 3-stage drafter that
-   no MLX runtime implements. Ported here. **1.72x decode.**
+   no MLX runtime implements. Ported here, and its acceptance is excellent —
+   but the KV rollback is not yet sound, so **no decode speedup is claimed**.
+   See *Status* below before using it.
 
 ---
 
@@ -45,21 +47,23 @@ shape matters more than the ratio for agentic use.
 
 ### Decode
 
-| | tok/s |
-|---|---|
-| greedy, single stream | 31.1 |
-| **+ DSpark speculative decoding** | **47.1** (1.72x) |
+**Speculative decoding is not yet usable — do not rely on a speedup number.**
+An earlier revision of this README claimed 47.1 tok/s (1.72x). That measurement
+was taken with a broken cache rollback (see *Status* below) and is withdrawn.
+Baseline greedy decode is **31.1 tok/s**, and ~25-30 tok/s on long agentic
+contexts.
 
-DSpark acceptance is strongly content-dependent — inherent to the method, not
-this port. Accepted prefix out of 5 drafts:
+What *is* measured and sound is the drafter's acceptance — those runs never
+roll back, they compare drafts against ground-truth autoregressive decoding.
+Accepted prefix out of 5 drafts:
 
 | content | pos 1 | pos 2 | pos 3 | pos 4 | pos 5 | E[prefix] | tokens/cycle |
 |---|---|---|---|---|---|---|---|
 | structured code | 100% | 96% | 96% | 92% | 96% | **4.75** | 5.75 |
 | open-ended prose | 71% | 21% | 8% | 17% | 8% | 1.00 | 2.00 |
 
-A 6-token verify costs ~1.80x one decode step, so the ceiling on code is ~2.76x;
-on prose speculation is break-even and should be off.
+A 6-token verify costs ~1.80x one decode step, so the ceiling on code would be
+~2.76x — but that is a projection, not a measurement, until rollback is fixed.
 
 ---
 
@@ -157,9 +161,32 @@ python3 tools/audit_quant.py ~/.omlx/models/Vontra/DeepSeek-V4-Flash-0731-MXFP4-
 
 ## DSpark speculative decoding
 
-**Status: works, benchmarked, not yet wired into the oMLX server.** The scripts
-below run it standalone. Server integration needs hooking oMLX's
-`BatchGenerator`, which is not done.
+**Status: architecture ported and verified, throughput NOT yet usable.**
+
+The drafter loads clean (115/115 tensors, 0 missing, 0 unexpected, 0 shape
+mismatches) and its acceptance is measured and high. What is not solved is
+rolling rejected drafts back out of the KV cache:
+
+- `RotatingKVCache` — solved. `is_trimmable()` is False once rotated, but a
+  verify has S>1 which always takes `_update_concat`, and that rebinds
+  `keys`/`values` in temporal order, so the rejected tail can be sliced off
+  (`_trim_rotating`).
+- `CacheList` — was silently skipped, because it is **not** a `list` subclass;
+  an `isinstance(x, (list, tuple))` check misses it. Fixed by unwrapping
+  `.caches`.
+- `PoolingCache` — **unsolved.** `trim(n)` only succeeds when the rejected
+  tokens are still in the un-pooled remainder buffer, or a *one-update* undo log
+  covers them. A 5-draft verify routinely crosses a pooling boundary, so it
+  returns 0 and the compressed layers keep the rejected drafts.
+
+Until that last one is fixed, speculation corrupts the caches of the 41
+compressed layers. The output still *looks* plausible — rejected drafts are, by
+construction, plausible continuations — which is precisely why the earlier
+throughput number went unchallenged. Treat any speculative speedup as unproven.
+
+Fix path: give `PoolingCache` a multi-update undo log. It already stores the
+update's `kv`/`gate` and replays the confirmed prefix via `accumulate_windows`;
+the `_can_undo` guard (`undo[2] + k < ratio`) is what blocks k>1.
 
 The checkpoint ships DSpark under `mtp.*` — three *heterogeneous* stages, not the
 DeepSeek-V3 MTP head:

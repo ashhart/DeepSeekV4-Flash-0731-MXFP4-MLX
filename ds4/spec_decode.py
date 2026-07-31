@@ -56,23 +56,36 @@ def _trim_rotating(c, n: int) -> None:
     c._idx = c.keys.shape[2]
 
 
+def _unwrap(layer_cache) -> list:
+    """Flatten a layer's cache into its concrete cache objects.
+
+    `CacheList` is NOT a list subclass -- it wraps `.caches` -- so an
+    `isinstance(x, (list, tuple))` check silently misses it. Its own `trim()`
+    delegates to `RotatingKVCache.trim()`, which no-ops once the ring has
+    rotated (`is_trimmable()` is False), so rejected drafts would survive as
+    phantom tokens on 41 of this model's 43 layers.
+    """
+    if layer_cache is None:
+        return []
+    caches = getattr(layer_cache, "caches", None)
+    if caches is not None:
+        return [c for c in caches if c is not None]
+    if isinstance(layer_cache, (list, tuple)):
+        return [c for c in layer_cache if c is not None]
+    return [layer_cache]
+
+
 def trim_cache(cache, n: int) -> int:
     """Roll `n` rejected positions back out of every layer's cache."""
     if n <= 0:
         return 0
     for layer_cache in cache:
-        entries = (
-            list(layer_cache)
-            if isinstance(layer_cache, (list, tuple))
-            else [layer_cache]
-        )
-        for c in entries:
-            if c is None:
-                continue
+        for c in _unwrap(layer_cache):
             if type(c).__name__.endswith("RotatingKVCache"):
                 _trim_rotating(c, n)
             elif hasattr(c, "trim"):
-                c.trim(n)
+                if c.trim(n) != n:
+                    return -1
             else:
                 return -1
     return n
