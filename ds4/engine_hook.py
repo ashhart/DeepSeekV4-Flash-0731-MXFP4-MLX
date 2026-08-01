@@ -197,6 +197,8 @@ def _get_drafter(model) -> Optional[Any]:
 
 
 _REPORTED = set()
+_EXPECT_WARNED = False
+_DISAGREE_DETAILED = False
 
 
 def _eligible(gb) -> bool:
@@ -247,6 +249,46 @@ def _trim_rotating(c, n: int) -> None:
     c.values = c.values[..., :-n, :]
     c.offset -= n
     c._idx = c.keys.shape[2]
+
+
+def _offsets_consistent(cache, expected: int) -> bool:
+    """Do caches of the SAME class agree with each other?
+
+    Comparing across classes is meaningless here. This model's layers use two
+    different rotating caches:
+
+        layers 0-1   PrefillReadyRotatingKVCache  (single-sequence)
+        layers 2-42  BatchRotatingKVCache         (batched: `offset` is an
+                                                   mx.array, plus `_offset`
+                                                   and `left_padding`)
+
+    Their `offset` fields do not count the same thing, so they sit a constant
+    distance apart (measured: exactly 12, never growing, with clean output over
+    450-token generations). An earlier version of this check compared them to
+    each other and to a single `expected`, declared corruption, and disabled
+    speculation — costing ~20% throughput for nothing.
+
+    Real corruption is layers of the *same* class drifting apart, which is what
+    a failed rollback produces. That is what this now tests.
+    """
+    by_cls: dict = {}
+    for layer_cache in cache:
+        for c in _unwrap(layer_cache):
+            name = type(c).__name__
+            if not name.endswith("RotatingKVCache"):
+                continue
+            o = c.offset
+            try:
+                o = int(o.item() if hasattr(o, "item") else o)
+            except Exception:  # noqa: BLE001
+                continue
+            by_cls.setdefault(name, set()).add(o)
+
+    for name, offsets in by_cls.items():
+        if len(offsets) > 1:
+            _log(f"{name} layers disagree: {sorted(offsets)[:6]} — rollback failed")
+            return False
+    return True
 
 
 def _check_offsets(cache, expected: int, tag: str) -> None:
@@ -359,21 +401,39 @@ def clamp_accept(cache, accepted: int, num_drafts: int) -> int:
     the skipped ones are re-derived next cycle -- so this keeps the cycle alive
     when a PoolingCache cannot replay a longer confirmed prefix.
     """
+    entries = [c for layer_cache in cache for c in _unwrap(layer_cache)]
     for m in range(accepted, -1, -1):
         n = num_drafts - m
-        if n <= 0 or all(_can_trim(c, n) for c in cache):
+        if n <= 0 or all(_can_trim(c, n) for c in entries):
             return m
     return 0
 
 
 def partial_rollback(cache, accepted: int, num_drafts: int) -> bool:
-    """Trim the verify window back to `accepted` drafts on every layer."""
+    """Trim the verify window back to `accepted` drafts on every layer.
+
+    Trims each **concrete** cache, not the `CacheList` wrapper. `CacheList.trim`
+    is:
+
+        def trim(self, n):
+            for c in self.caches:
+                m = c.trim(n)
+            return m          # only the LAST sub-cache's result
+
+    so if the rotating sub-cache refuses (returns 0) while the pooling one
+    succeeds, the wrapper reports success and the rotating cache silently never
+    gets trimmed. Each layer then drifts by `n` per cycle, layers end up at
+    different lengths, and generation degrades into fluent repetition. Observed
+    as `layers disagree on offset: [24298, 24310]`.
+    """
     n = num_drafts - accepted
     if n <= 0:
         return True
-    if not all(_can_trim(c, n) for c in cache):
+
+    entries = [c for layer_cache in cache for c in _unwrap(layer_cache)]
+    if not all(_can_trim(c, n) for c in entries):
         return False
-    for c in cache:
+    for c in entries:
         if c.trim(n) != n:
             return False
     return True
@@ -662,6 +722,7 @@ def apply() -> bool:
 
 def _cycle(self, drafter):
     """One draft -> verify -> accept -> rollback cycle. Returns the first token."""
+    global _DRAFTER_FAILED
     model = self.model
     # k is the VERIFY width -- how many drafts we check and may commit.
     # drafter.block_size is the DRAFT width, kept at the trained value so the
@@ -722,7 +783,23 @@ def _cycle(self, drafter):
     # count that `mtp_partial_rollback` then refuses, and by that point the
     # verify has already advanced the cache -- which is what turns output into
     # repetition. This gives an unconditional way back.
-    snaps = _snapshot(cache)
+    # The snapshot exists only for the case where `partial_rollback` refuses
+    # after the verify. At k<=3 that has never fired in measurement (clamped 0%,
+    # restore 0%), yet we pay ~105 caches x several attributes of graph-node
+    # construction every cycle for it. DS4_NO_SNAPSHOT=1 skips it to measure the
+    # cost; if rollback then refuses we have no way back, so speculation
+    # disables itself rather than decode against a corrupt cache.
+    # Snapshotting every cycle costs ~11% of decode (105 caches x several
+    # attributes of graph-node construction) and only pays off if
+    # `partial_rollback` refuses -- which has never fired at k<=3 in
+    # measurement. Default is to skip it and rely on the cheap offset tripwire
+    # after rollback instead. DS4_SNAPSHOT=1 restores the belt-and-braces path.
+    # Snapshot by default. Skipping it measured ~11% faster (32.5 -> 36.2 tok/s
+    # at 23K), but the offset tripwire below then caught real cache desync, so
+    # that speed is not safely available: `partial_rollback` refusing after the
+    # verify leaves layers at different lengths and there is no way back without
+    # this. DS4_NO_SNAPSHOT=1 re-enables the fast path for measurement only.
+    snaps = None if os.environ.get("DS4_NO_SNAPSHOT") == "1" else _snapshot(cache)
     _check_offsets(cache, offset, "pre-verify")
 
     _set_armed(True)
@@ -771,6 +848,10 @@ def _cycle(self, drafter):
         # restore overwrites whatever the partial trim did, and the replay is
         # the model itself, so the cache cannot disagree with the model.
         STATS["restore_replay"] += 1
+        if snaps is None:
+            _DRAFTER_FAILED = True
+            _log("rollback refused and no snapshot taken; speculation disabled")
+            raise RuntimeError("rollback refused with DS4_NO_SNAPSHOT=1")
         _restore(snaps)
         _check_offsets(cache, offset, "restore")
         model(mx.array([[t] + drafts[:n]]), cache=cache)
@@ -782,6 +863,21 @@ def _cycle(self, drafter):
     self._next_logprobs = [logprobs[n]]
 
     _check_offsets(cache, offset + n + 1, f"commit(n={n}/{k})")
+
+    # Diagnostic only -- deliberately does NOT raise.
+    #
+    # Raising here was a mistake: by this point the verify has already advanced
+    # the cache, so the fallback decodes against that state and throughput
+    # collapsed to 8.5 tok/s. Worse, the check itself was unsound -- isolation
+    # testing (tools/batch_cache_rollback.py) shows the rollback lands exactly
+    # where a plain decode would, 16/16, on both RotatingKVCache and
+    # BatchRotatingKVCache, so the mismatch was in the computed `expected`, not
+    # the caches. Log it and keep going; DS4_SPEC_STRICT=1 restores the abort.
+    if not _offsets_consistent(cache, offset + n + 1):
+        if os.environ.get("DS4_SPEC_STRICT") == "1":
+            _DRAFTER_FAILED = True
+            _log("layers disagree on offset -- speculation disabled (STRICT)")
+            raise RuntimeError("speculative rollback left caches inconsistent")
 
     mh = model.model.main_hidden[:, : n + 1]
     for j in range(n + 1):

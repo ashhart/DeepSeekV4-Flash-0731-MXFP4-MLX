@@ -62,19 +62,33 @@ tokens) went from ~59s to **~6.9s**.
 
 ### Decode
 
-Measured by slope, 8-bit `lm_head` enabled:
+Measured by *slope* (generate N1 and N2 tokens from the same prompt, take
+`(N2-N1)/(t2-t1)`) so prefill and per-request overhead cancel:
 
-| | decode |
-|---|---|
-| 23K cached context, speculation off | 26.1 tok/s |
-| **23K cached context, speculation on** | **32.5 tok/s** (1.25x) |
-| short prompt, speculation on | 41.6 tok/s |
+| | speculation off | **speculation on** |
+|---|---|---|
+| 23K cached context | 26.2 tok/s | **35.0 tok/s** (1.34x) |
+| short prompt | — | **40.6 tok/s** |
 
-Decode slows as context grows — that is the KV attention term, not a regression.
+Both with the 8-bit `lm_head` below. A decode step moves ~10.1 GB of weights
+against 819 GB/s, so **~81 tok/s is the hard non-speculative ceiling** here.
 
-A decode step moves ~10.1 GB of weights (with the 8-bit head) against 819 GB/s,
-so **~81 tok/s is the hard non-speculative ceiling** on this hardware. Anything
-claiming to approach that without speculation is a measurement error.
+#### For comparison: dual DGX Spark
+
+A published dual-Spark benchmark of the same model reports **72.8 tok/s
+single-stream** — genuinely faster, on two nodes with TP=2 halving per-node
+weight traffic. The rest of that run is worth reading though:
+
+| concurrency | aggregate | per-stream | TTFT |
+|---|---|---|---|
+| x1 | 72.8 | 72.8 | 237ms |
+| x2 | 102.0 | 53.1 | 1.55s |
+| x4 | 120.0 | 35.4 | 7.68s |
+| x8 | 147.0 | 23.8 | 4.91s |
+
+Per-stream falls to 35.4 at x4 and 23.8 at x8, so at real concurrency a single
+M3 Ultra is level or ahead — and its cached prefill at 23K is ~1.2s against
+their 7.68s TTFT at x4. Single-stream x1 is where two nodes win.
 
 ### Draft block size
 
@@ -263,7 +277,12 @@ python3 tools/audit_quant.py ~/.omlx/models/Vontra/DeepSeek-V4-Flash-0731-MXFP4-
 ```sh
 touch ~/.omlx/ds4_spec_enabled     # on
 rm    ~/.omlx/ds4_spec_enabled     # off
-pkill -f 'oMLX|omlx-server'; open -a oMLX
+
+# Restart. NOTE the lowercase pattern: the server process is `omlx-server`,
+# and `pkill -f "oMLX"` is case-sensitive so it will NOT kill it -- `omlx start`
+# then finds port 8000 in use and silently keeps the OLD code running.
+pkill -9 -f 'omlx-server'; pkill -9 -f 'oMLX'; sleep 5
+~/.omlx/bin/omlx start          # or launch oMLX.app from the Dock
 ```
 
 Knobs: `DS4_SPEC_BLOCK` (verify width, default 3), `DS4_SPEC_DRAFT_WIDTH`
@@ -301,31 +320,48 @@ That same non-causality is why drafting wider than the trained width backfires.
 
 ### The rollback bug (worth reading if you build on this)
 
-Rejected drafts must come back out of the KV cache. Getting that wrong does not
-crash — it produces fluent repetition ("The user id. The user id. ...") while
-throughput *looks* great, because a rejected draft is a plausible continuation.
-Three distinct traps, all hit here:
+Rejected drafts must come back out of the KV cache. Getting it wrong does not
+crash — it produces fluent repetition while throughput *looks* fine, because a
+rejected draft is by construction a plausible continuation. Four distinct traps,
+all hit here:
 
 1. **`CacheList` is not a `list` subclass** — it wraps `.caches`. An
    `isinstance(x, (list, tuple))` check silently skips every compressed layer.
-2. **Snapshots must be detached.** The server uses `BatchRotatingKVCache`, whose
-   `offset` is an `mx.array` **mutated in place**; a plain reference reads back
-   the *post*-update value, making the snapshot a no-op. oMLX's own
-   `cache_rollback` does `v = v + 0` for exactly this. Snapshot the whole
-   instance dict, not a hand-listed set of fields.
-3. **oMLX's MTP patch is self-healing** — it reinstalls its own
-   `DeepseekV4Model.__call__` whenever it sees a foreign one, during model load.
-   A class-level "already patched" flag therefore never re-wraps; mark the
-   function instead. oMLX also re-registers `mlx_lm.models.deepseek_v4` from
-   source per load, so class patches must be re-applied every time.
 
-Rollback itself goes through oMLX's own tested helpers — `mtp_clamp_accept`
-(reduce accepted until every layer can undo), `mtp_partial_rollback`, and the
-armed undo log (`set_undo_armed`, covering updates of 2..8 tokens). Do not
-hand-roll these; they already exist and are correct.
+2. **`CacheList.trim` masks refusals.** It is:
 
-`tools/cache_invariants.py` and `tools/pooling_rollback_test.py` reproduce the
-cache behaviour with no model load.
+   ```python
+   def trim(self, n):
+       for c in self.caches:
+           m = c.trim(n)
+       return m          # only the LAST sub-cache's result
+   ```
+
+   Each layer holds `[RotatingKVCache, PoolingCache]`. If the rotating one
+   refuses (returns 0) while the pooling one succeeds, the wrapper reports
+   success and the rotating cache never gets trimmed. **Trim the concrete
+   caches, never the wrapper.**
+
+3. **Snapshots must be detached.** `BatchRotatingKVCache.offset` is an
+   `mx.array` *mutated in place*, so a plain reference reads back the
+   post-update value and the snapshot is a silent no-op. oMLX's own
+   `cache_rollback` does `v = v + 0` for exactly this reason.
+
+4. **There are TWO rotating cache classes, and their `offset` fields are not
+   comparable.** Layers 0-1 use `PrefillReadyRotatingKVCache`; layers 2-42 use
+   `BatchRotatingKVCache` (batched, with `_offset` and `left_padding`). They sit
+   a constant 12 apart, forever, with perfectly clean output. An integrity check
+   that compares *across* classes will declare corruption that is not there —
+   this cost ~20% throughput before it was understood. **Compare within a class;
+   same-class layers drifting apart is the real corruption signal.**
+
+`tools/batch_cache_rollback.py` reproduces the rollback for both classes with no
+model load (16/16 land exactly where a plain decode would).
+`tools/cache_invariants.py` and `tools/pooling_rollback_test.py` cover the
+`RotatingKVCache` and `PoolingCache` state machines the same way.
+
+Rollback itself goes through oMLX's `cache_rollback` armed undo log
+(`set_undo_armed`, covering updates of 2..8 tokens). Do not hand-roll it.
 
 ### Standalone scripts
 
