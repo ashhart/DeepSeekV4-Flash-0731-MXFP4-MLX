@@ -1,6 +1,6 @@
 # DeepSeek-V4-Flash-0731 MXFP4 — fast on Apple Silicon
 
-> ## ⚠️ oMLX 0.5.4rc2 and later: do NOT enable this recipe's speculation
+> ## ⚠️ oMLX 0.5.4rc2 and later: this recipe is SUPERSEDED — disable all of it
 >
 > **oMLX 0.5.4rc2 ships native DSpark Lightning MTP** with Metal kernels for the
 > DSpark projections, routed experts, DSA indexer scoring and block verification.
@@ -11,9 +11,23 @@
 > crash — it produces fluent-looking corruption, with the model restarting the
 > same sentence over and over in slightly different words. Verified on rc2.
 >
-> On rc2+, remove the marker (`rm ~/.omlx/ds4_spec_enabled`) and use upstream's
-> native MTP. The rest of this recipe's history is kept below as a record of how
-> the checkpoint and the measurements were produced.
+> **The incompatibility is not limited to speculation.** With the speculation
+> marker OFF and only the 8-bit head, QKV/RoPE fusion and async cache enabled,
+> rc2 aborts generation with `Cache corruption not recoverable after retries:
+> 'NoneType' object is not subscriptable`. This recipe's cache patches were
+> written against rc1 internals that rc2 restructured for native MTP.
+>
+> **On rc2+, remove the whole thing** — delete the `.pth` that imports
+> `ds4_boot` and every `~/.omlx/ds4_*` marker — and use upstream's native MTP.
+> It is also simply faster at long context:
+>
+> | configuration | 23K | short |
+> | --- | --- | --- |
+> | rc1 + this recipe | 37.6–40.7 | 47.7–50.1 |
+> | **rc2 stock, native MTP** | **41.7** | 40.6 |
+>
+> The rest of this recipe is kept as a record of how the checkpoint and the
+> measurements were produced.
 >
 > Note that native MTP requires a checkpoint with the embedded `dspark_*`
 > weights. `mlx-community/DeepSeek-V4-Flash-4bit` has them stripped (zero
