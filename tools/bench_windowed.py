@@ -29,7 +29,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("model_dir")
     ap.add_argument("--lengths", default="2048,4096,8192")
-    ap.add_argument("--block", type=int, default=512)
+    ap.add_argument("--block", type=int, default=256)
+    ap.add_argument("--text-file", default=None)
     args = ap.parse_args()
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -46,14 +47,34 @@ def main() -> int:
     print(f"loaded; resident {mx.get_active_memory() / 1024**3:.1f} GiB\n")
 
     lens = [int(x) for x in args.lengths.split(",")]
+
+    def make_ids(L):
+        """Real text where available.
+
+        Random tokens activate essentially every MoE expert (worst case) and a
+        repeated token activates almost none (best case), so prefill numbers
+        taken on either are not representative of real traffic.
+        """
+        if args.text_file:
+            from mlx_lm.tokenizer_utils import load as load_tok
+
+            toks = load_tok(Path(args.model_dir)).encode(
+                Path(args.text_file).read_text()
+            )
+            while len(toks) < L:
+                toks = toks + toks
+            return mx.array([toks[:L]])
+        mx.random.seed(0)
+        return mx.random.randint(0, 100000, (1, L))
+
+
     dense = {}
 
     print(f"{'L':>7} {'dense tok/s':>13} {'windowed tok/s':>16} {'speedup':>9} {'max|dlogit|':>13}")
     print("-" * 62)
 
     for L in lens:
-        mx.random.seed(0)
-        ids = mx.random.randint(0, 100000, (1, L))
+        ids = make_ids(L)
 
         prefill(model, ids)
         mx.clear_cache()
@@ -69,8 +90,7 @@ def main() -> int:
     windowed_prefill.apply(block=args.block)
 
     for L in lens:
-        mx.random.seed(0)
-        ids = mx.random.randint(0, 100000, (1, L))
+        ids = make_ids(L)
 
         prefill(model, ids)
         mx.clear_cache()

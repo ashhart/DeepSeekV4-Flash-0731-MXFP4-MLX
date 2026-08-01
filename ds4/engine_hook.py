@@ -210,8 +210,6 @@ def _eligible(gb) -> bool:
         "is_deepseek_v4": getattr(model, "model_type", None) == "deepseek_v4",
         # Rollback goes through oMLX's own helpers; without them there is no
         # sound way to undo a rejected draft, so stay on the stock path.
-        "has_mtp_clamp_accept": hasattr(model, "mtp_clamp_accept"),
-        "has_mtp_partial_rollback": hasattr(model, "mtp_partial_rollback"),
         "has_main_hidden": getattr(model.model, "main_hidden", None) is not None,
     }
     bad = [k for k, v in checks.items() if not v]
@@ -303,14 +301,18 @@ def _set_armed(flag: bool) -> None:
 
 
 def _ensure_rollback_patch() -> None:
-    """Make oMLX's rollback machinery available.
+    """Attach oMLX's rotating-cache undo log.
 
-    Two separate patches:
-      * `cache_rollback.apply()` wraps RotatingKVCache with the armed undo log.
-      * the MTP model patch attaches `mtp_clamp_accept` / `mtp_partial_rollback`
-        to the Model class. Both are safe to apply with `mtp_enabled` off --
-        building the MTP heads is separately gated on `is_mtp_active()`, so this
-        adds the rollback helpers without changing how the model loads.
+    NOTE: deliberately does NOT apply oMLX's MTP *model* patch. That patch
+    replaces `DeepseekV4Model.__call__` and `make_cache`, and measured **-21% on
+    prefill** at 25K context (396 -> 311 tok/s). For prompt-heavy agent traffic
+    prefill dominates -- a 25K prompt is ~58s of prefill against ~2.5s of decode
+    -- so paying 21% there to win 1.5x on decode is a net loss. The three
+    helpers we actually needed from it (`_can_trim`, `clamp_accept`,
+    `partial_rollback`) are reimplemented below instead.
+
+    `cache_rollback` itself is cheap: it only wraps `update_and_fetch` with a
+    stash that is skipped unless armed.
     """
     try:
         from omlx.patches.mlx_lm_mtp import cache_rollback
@@ -319,12 +321,62 @@ def _ensure_rollback_patch() -> None:
     except Exception as e:  # noqa: BLE001
         _log(f"cache_rollback not available: {type(e).__name__}: {e}")
 
-    try:
-        from omlx.patches.mlx_lm_mtp import deepseek_v4_model as mtp_model
 
-        mtp_model.apply()
-    except Exception as e:  # noqa: BLE001
-        _log(f"MTP model patch not available: {type(e).__name__}: {e}")
+def _can_trim(c, n: int) -> bool:
+    """Non-mutating check that `c.trim(n)` will succeed.
+
+    Mirrors oMLX's `_cache_can_trim`. Must be checked for every layer *before*
+    trimming any of them: a trim that fails partway leaves per-layer lengths
+    desynchronised, which is the phantom-token corruption.
+    """
+    caches = getattr(c, "caches", None)
+    if caches is not None:
+        return all(_can_trim(sub, n) for sub in caches)
+
+    remainder = getattr(c, "remainder", None)
+    if remainder is not None:  # PoolingCache / BatchPoolingCache
+        rem_min = remainder if isinstance(remainder, int) else min(remainder)
+        if n <= rem_min:
+            return True
+        can_undo = getattr(c, "_can_undo", None)
+        return bool(can_undo and can_undo(n))
+
+    is_trimmable = getattr(c, "is_trimmable", None)
+    if callable(is_trimmable) and is_trimmable():
+        return True
+    # A rotated RotatingKVCache is only trimmable via cache_rollback's armed
+    # undo stash, which covers the last multi-token write.
+    undo = getattr(c, "_mtp_undo", None)
+    if undo is not None:
+        return undo[1].shape[2] >= n
+    return False
+
+
+def clamp_accept(cache, accepted: int, num_drafts: int) -> int:
+    """Largest m <= accepted whose rollback every layer supports.
+
+    Emitting fewer verified drafts than acceptance allowed is always correct --
+    the skipped ones are re-derived next cycle -- so this keeps the cycle alive
+    when a PoolingCache cannot replay a longer confirmed prefix.
+    """
+    for m in range(accepted, -1, -1):
+        n = num_drafts - m
+        if n <= 0 or all(_can_trim(c, n) for c in cache):
+            return m
+    return 0
+
+
+def partial_rollback(cache, accepted: int, num_drafts: int) -> bool:
+    """Trim the verify window back to `accepted` drafts on every layer."""
+    n = num_drafts - accepted
+    if n <= 0:
+        return True
+    if not all(_can_trim(c, n) for c in cache):
+        return False
+    for c in cache:
+        if c.trim(n) != n:
+            return False
+    return True
 
 
 def _snapshot(cache) -> list:
@@ -492,8 +544,8 @@ def _maybe_quantize_head(model) -> None:
         marker = Path.home() / ".omlx" / "ds4_head_bits"
         if marker.exists():
             bits = marker.read_text().strip()
-    if not bits:
-        return
+    if not bits or str(bits).strip() in ("0", "off", "none", "bf16"):
+        return  # explicit off, for A/B measurement
     try:
         bits = int(bits)
         import mlx.nn as nn
@@ -695,7 +747,7 @@ def _cycle(self, drafter):
     # the largest m <= n that every layer can undo. Emitting fewer drafts than
     # were verified is always correct -- the rest are re-derived next cycle.
     n_raw = n
-    n = int(model.mtp_clamp_accept(cache, n, k))
+    n = int(clamp_accept(cache, n, k))
     STATS["cycles"] += 1
     STATS["raw_accepted"] += n_raw
     STATS["clamped_accepted"] += n
@@ -713,7 +765,7 @@ def _cycle(self, drafter):
             "if you see repetition."
         )
 
-    if not model.mtp_partial_rollback(cache, n, k):
+    if not partial_rollback(cache, n, k):
         # Refused (possibly after partially trimming some layers). Restore the
         # pre-verify state wholesale and re-run only the accepted tokens. The
         # restore overwrites whatever the partial trim did, and the replay is

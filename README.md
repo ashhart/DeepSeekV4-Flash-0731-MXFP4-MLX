@@ -26,58 +26,59 @@ Three things live here:
 Mac Studio, **M3 Ultra** (80-core GPU, 256 GB, 819 GB/s), macOS 26.6,
 mlx 0.32.0 / mlx-lm 0.31.3, oMLX. Weights resident 145.5 GiB.
 
-### Prefill, through the oMLX API
+> **On methodology.** Decode figures below are measured by *slope* — generate
+> N1 and N2 tokens from the same prompt and take `(N2-N1)/(t2-t1)` — so prefill
+> and per-request overhead cancel. Earlier revisions of this README timed
+> `max_tokens=1` and subtracted it from `max_tokens=200`; at long context
+> prefill dominates and varies run to run, so that method produced 34.4 and 77.4
+> tok/s from *identical* requests whose total time was ~6.9s both times. Those
+> numbers were withdrawn. Do not trust a decode figure that was not taken by
+> slope or by an equivalent prefill-independent method.
 
-| prompt tokens | stock | **patched** |
-|---|---|---|
-| 7,209 | — | 518 tok/s |
-| 14,409 | — | **937 tok/s** |
-| 28,809 | — | **938 tok/s** |
+### The biggest win is a config value, not a kernel
 
-Flat from 14K to 28K. For comparison, measured directly against the dense path:
+oMLX's prompt cache ships **disabled**: `hot_cache_max_size` defaults to `"0"`,
+which the config comments mark as off. Combined with **Hot Cache Only** (RAM
+only, no SSD spill) that means nothing is cached and every turn re-prefills the
+whole prompt.
 
-| L | dense | windowed | speedup |
+It is easy to miss because the admin UI's **CACHE** panel shows only *Cache
+Enabled*, *Hot Cache Only* and *SSD Cache Directory* — all of which look
+correctly configured. The size lives in a different section, **Memory
+Management → "Memory Limit (In-Memory Hot Cache)"**.
+
+Setting it (e.g. 24GB, in `~/.omlx/settings.json` or that UI field), on a
+repeated 23.7K-token prompt:
+
+| run | prompt tokens | cached | wall |
 |---|---|---|---|
-| 4,096 | 425 | 536 | 1.26x |
-| 8,192 | 345 | 603 | 1.74x |
-| 16,384 | 183 | 595 | **3.25x** |
+| 1 | 23,716 | 0 | **51.0s** |
+| 2 | 23,716 | 23,552 | **4.6s** |
 
-The dense path halves from 8K to 16K; the windowed path does not move. That
-shape matters more than the ratio for agentic use.
+**~11x on the turn.** For agent traffic that resends a growing context every
+turn, prefill is the overwhelming majority of wall-clock time and this dominates
+every other optimisation here. A full agent turn (23.6K cached prompt + 200
+tokens) went from ~59s to **~6.9s**.
 
 ### Decode
 
-| | tok/s |
+Measured by slope, 8-bit `lm_head` enabled:
+
+| | decode |
 |---|---|
-| baseline greedy | 28-30 |
-| + DSpark speculative decoding (k=3) | ~40 (1.41x) |
-| **+ DSpark + 8-bit `lm_head`** | **43-48** (1.5-1.6x) |
+| 23K cached context, speculation off | 26.1 tok/s |
+| **23K cached context, speculation on** | **32.5 tok/s** (1.25x) |
+| short prompt, speculation on | 41.6 tok/s |
 
-#### `lm_head` — the biggest lever, and nothing to do with speculation
+Decode slows as context grows — that is the KV attention term, not a regression.
 
-The checkpoint deliberately leaves the output head unquantized (`config.json`
-has `"head": false`), so it is 129280x4096 in bf16 = **1.06 GB read per
-forward** — roughly 10% of everything a decode step moves. Speculation reads it
-**twice** per cycle (once in the drafter, once in the verify), so ~17% of the
-cycle's bytes. Quantizing it halves that:
+A decode step moves ~10.1 GB of weights (with the 8-bit head) against 819 GB/s,
+so **~81 tok/s is the hard non-speculative ceiling** on this hardware. Anything
+claiming to approach that without speculation is a measurement error.
 
-| `lm_head` | bytes/read | speculative tok/s |
-|---|---|---|
-| bf16 (stock) | 1.06 GB | 38.9 |
-| **8-bit** | **0.56 GB** | **46.4-48.2** |
-| 6-bit | 0.43 GB | 43.3 |
+### Draft block size
 
-6-bit moves *fewer* bytes than 8-bit and is *slower* — MLX's 8-bit quantized
-matmul is better optimised, so do not assume narrower is faster. Opt-in, since
-it does perturb the logits:
-
-```sh
-echo 8 > ~/.omlx/ds4_head_bits     # or DS4_QUANT_HEAD=8
-```
-
-#### Draft width
-
-Measured over 200 tokens, after the rollback was fixed:
+Relative comparison, hook off vs hook on in the same process (short prompt):
 
 | verify k | speedup | accepted prefix | clamped | restore+replay |
 |---|---|---|---|---|
@@ -89,9 +90,7 @@ Measured over 200 tokens, after the rollback was fixed:
 **Draft width and verify width are separate knobs** (`DS4_SPEC_DRAFT_WIDTH` vs
 `DS4_SPEC_BLOCK`). The drafter's block is non-causal — every draft position
 attends to every other — so its width is part of its input distribution, not a
-free parameter. It is left at the trained value while only a prefix is verified.
-Drafting wider than you verify buys a little acceptance (1.67 -> 1.82 going
-3 -> 7) for a little more drafter compute.
+free parameter. It stays at the trained value while only a prefix is verified.
 
 Verifying wider is worse, for two compounding reasons:
 
@@ -101,24 +100,57 @@ Verifying wider is worse, for two compounding reasons:
 2. Above k=3 the `PoolingCache` rollback starts refusing, and each refusal costs
    a full cache restore plus a replay forward.
 
-> An earlier revision of this README claimed 47.1 / 1.72x, and briefly 2.06x at
-> k=7. **Those are withdrawn** — they were measured against a corrupt KV cache
-> (see *The rollback bug*). Output looked plausible because a rejected draft is
-> by construction a plausible continuation.
+> Earlier revisions claimed 47.1 / 1.72x, and briefly 2.06x at k=7. **Withdrawn**
+> — measured against a corrupt KV cache (see *The rollback bug*), whose output
+> was fluent repetition.
 
-#### Standalone drafter acceptance
+### `lm_head` quantization
 
-Measured against ground-truth autoregressive decoding with no rollback involved,
-at the trained width on clean code — so unaffected by any of the above:
+The checkpoint leaves the output head unquantized (`"head": false`), so it is
+129280x4096 bf16 = **1.06 GB read per forward**, and speculation reads it twice
+per cycle. Quantizing it halves that. Quality measured teacher-forced over 2047
+positions against the untouched bf16 head:
 
-| content | pos 1 | pos 2 | pos 3 | pos 4 | pos 5 | E[prefix] |
-|---|---|---|---|---|---|---|
-| structured code | 100% | 96% | 96% | 92% | 96% | **4.75** |
-| open-ended prose | 71% | 21% | 8% | 17% | 8% | 1.00 |
+| `lm_head` | bytes | perplexity | vs bf16 | top-1 agree | KL (nats) |
+|---|---|---|---|---|---|
+| bf16 (stock) | 1.06 GB | 8.3103 | — | — | — |
+| **8-bit g64** | **0.56 GB** | **8.3019** | **-0.10%** | **98.78%** | 0.00073 |
+| 8-bit g32 | 0.60 GB | 8.2909 | -0.23% | 98.93% | 0.00072 |
+| 6-bit g64 | 0.43 GB | 8.3088 | -0.02% | 97.07% | 0.00256 |
+| 4-bit g64 | 0.30 GB | 8.5392 | **+2.75%** | 91.26% | 0.02625 |
 
-A 6-token verify costs ~1.80x one decode step. Acceptance is strongly
-content-dependent; in a real generation loop against mixed chat traffic it runs
-nearer 2.0/3, which is what the tables above reflect.
+8-bit is effectively lossless (the -0.10% is noise, not an improvement). **4-bit
+is clearly degraded — do not use it.** 6-bit moves fewer bytes than 8-bit and
+measured *slower*; MLX's 8-bit quantized matmul is better optimised.
+
+```sh
+echo 8 > ~/.omlx/ds4_head_bits     # or DS4_QUANT_HEAD=8
+```
+
+### Prefill
+
+> **The previously published 938 tok/s figure is withdrawn.** It was measured on
+> the same three-line function repeated 800 times, which collapses MoE routing
+> onto a handful of experts and is not representative. On real content, prefill
+> at 25K measures **~430 tok/s** through the server.
+
+The windowed-prefill kernel below removes a genuine `O(L^2)` term — the model
+builds a dense `(L, L)` mask despite a 128-token sliding window. The A/B ratios
+were measured on **random tokens**, which is the worst case for the dense path
+(every MoE expert activated), so treat the ratios as an upper bound and the
+shape as the real finding:
+
+| L | dense | windowed |
+|---|---|---|
+| 4096 | 425 | 536 |
+| 8192 | 345 | 603 |
+| 16384 | 183 | 595 |
+
+The dense path halves from 8K to 16K; the windowed path does not move. The
+equivalent A/B on real text has **not** been measured.
+
+With a working prompt cache, prefill is paid once per unique prefix rather than
+once per turn, which matters far more than either number above.
 
 ---
 
@@ -162,8 +194,18 @@ Remove with `./install.sh --uninstall`, or disable temporarily with
 In `~/.omlx/settings.json`:
 
 ```json
-{ "scheduler": { "chunked_prefill": false } }
+{
+  "cache":     { "hot_cache_max_size": "24GB" },
+  "scheduler": { "chunked_prefill": false }
+}
 ```
+
+**`hot_cache_max_size` is the important one** — it ships as `"0"`, which means
+*disabled*, so nothing is cached and every request re-prefills its whole prompt.
+See *The biggest win* above. Size it to taste; 24GB leaves plenty of headroom
+next to a 146 GiB resident model on a 256 GB machine. The same value is editable
+in the admin UI under **Memory Management → Memory Limit (In-Memory Hot Cache)**
+— note it is *not* in the CACHE panel, which is why it is easy to miss.
 
 Chunked prefill is a *different* fix for the same problem and the two work
 against each other: chunking shrinks `L` for the whole layer, and this model's
@@ -332,6 +374,10 @@ tools/audit_quant.py      ground truth from safetensors headers
 tools/bench_windowed.py   dense vs windowed prefill
 tools/server_prefill.py   prefill through the oMLX HTTP API
 tools/multitoken_cost.py  cost of a k-token verify
+tools/cache_check.py      does the prompt cache actually engage?
+tools/decode_rate.py      decode by slope (prefill-independent)
+tools/agent_turn.py       end-to-end timing of a realistic agent turn
+tools/head_quality.py     perplexity/top-1/KL cost of quantizing lm_head
 tools/cache_invariants.py RotatingKVCache trim behaviour, no model load
 tools/pooling_rollback_test.py  PoolingCache rollback exactness, no model load
 ```
