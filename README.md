@@ -47,24 +47,78 @@ shape matters more than the ratio for agentic use.
 
 ### Decode
 
-**Speculative decoding is not yet usable — do not rely on a speedup number.**
-An earlier revision of this README claimed 47.1 tok/s (1.72x). That measurement
-was taken with a broken cache rollback (see *Status* below) and is withdrawn.
-Baseline greedy decode is **31.1 tok/s**, and ~25-30 tok/s on long agentic
-contexts.
+| | tok/s |
+|---|---|
+| baseline greedy | 28-30 |
+| + DSpark speculative decoding (k=3) | ~40 (1.41x) |
+| **+ DSpark + 8-bit `lm_head`** | **43-48** (1.5-1.6x) |
 
-What *is* measured and sound is the drafter's acceptance — those runs never
-roll back, they compare drafts against ground-truth autoregressive decoding.
-Accepted prefix out of 5 drafts:
+#### `lm_head` — the biggest lever, and nothing to do with speculation
 
-| content | pos 1 | pos 2 | pos 3 | pos 4 | pos 5 | E[prefix] | tokens/cycle |
-|---|---|---|---|---|---|---|---|
-| structured code | 100% | 96% | 96% | 92% | 96% | **4.75** | 5.75 |
-| open-ended prose | 71% | 21% | 8% | 17% | 8% | 1.00 | 2.00 |
+The checkpoint deliberately leaves the output head unquantized (`config.json`
+has `"head": false`), so it is 129280x4096 in bf16 = **1.06 GB read per
+forward** — roughly 10% of everything a decode step moves. Speculation reads it
+**twice** per cycle (once in the drafter, once in the verify), so ~17% of the
+cycle's bytes. Quantizing it halves that:
 
-A 6-token verify costs ~1.80x one decode step. That acceptance was measured at
-the drafter's trained width on clean code; in the generation loop against mixed
-chat content it runs lower (~2.0/3), which is what the table above reflects.
+| `lm_head` | bytes/read | speculative tok/s |
+|---|---|---|
+| bf16 (stock) | 1.06 GB | 38.9 |
+| **8-bit** | **0.56 GB** | **46.4-48.2** |
+| 6-bit | 0.43 GB | 43.3 |
+
+6-bit moves *fewer* bytes than 8-bit and is *slower* — MLX's 8-bit quantized
+matmul is better optimised, so do not assume narrower is faster. Opt-in, since
+it does perturb the logits:
+
+```sh
+echo 8 > ~/.omlx/ds4_head_bits     # or DS4_QUANT_HEAD=8
+```
+
+#### Draft width
+
+Measured over 200 tokens, after the rollback was fixed:
+
+| verify k | speedup | accepted prefix | clamped | restore+replay |
+|---|---|---|---|---|
+| 2 | 1.28x | 1.49/2 | 0% | 0% |
+| **3** | **1.41-1.43x** | **2.01/3** | **0%** | **0%** |
+| 5 | 0.94-1.09x | 2.41/5 | 26% | 21% |
+| 7 | 0.49x | 1.65/7 | 50% | 32% |
+
+**Draft width and verify width are separate knobs** (`DS4_SPEC_DRAFT_WIDTH` vs
+`DS4_SPEC_BLOCK`). The drafter's block is non-causal — every draft position
+attends to every other — so its width is part of its input distribution, not a
+free parameter. It is left at the trained value while only a prefix is verified.
+Drafting wider than you verify buys a little acceptance (1.67 -> 1.82 going
+3 -> 7) for a little more drafter compute.
+
+Verifying wider is worse, for two compounding reasons:
+
+1. Padding the draft block past the trained width puts out-of-distribution noise
+   positions in view of the real ones, so the accepted prefix actually *falls*
+   (2.41 at k=5 -> 1.65 at k=7) despite drafting more tokens.
+2. Above k=3 the `PoolingCache` rollback starts refusing, and each refusal costs
+   a full cache restore plus a replay forward.
+
+> An earlier revision of this README claimed 47.1 / 1.72x, and briefly 2.06x at
+> k=7. **Those are withdrawn** — they were measured against a corrupt KV cache
+> (see *The rollback bug*). Output looked plausible because a rejected draft is
+> by construction a plausible continuation.
+
+#### Standalone drafter acceptance
+
+Measured against ground-truth autoregressive decoding with no rollback involved,
+at the trained width on clean code — so unaffected by any of the above:
+
+| content | pos 1 | pos 2 | pos 3 | pos 4 | pos 5 | E[prefix] |
+|---|---|---|---|---|---|---|
+| structured code | 100% | 96% | 96% | 92% | 96% | **4.75** |
+| open-ended prose | 71% | 21% | 8% | 17% | 8% | 1.00 |
+
+A 6-token verify costs ~1.80x one decode step. Acceptance is strongly
+content-dependent; in a real generation loop against mixed chat traffic it runs
+nearer 2.0/3, which is what the tables above reflect.
 
 ---
 
@@ -170,7 +224,9 @@ rm    ~/.omlx/ds4_spec_enabled     # off
 pkill -f 'oMLX|omlx-server'; open -a oMLX
 ```
 
-Tune the draft width with `DS4_SPEC_BLOCK` (default 3). Confirm it engaged:
+Knobs: `DS4_SPEC_BLOCK` (verify width, default 3), `DS4_SPEC_DRAFT_WIDTH`
+(default = trained width), `DS4_QUANT_HEAD` / `~/.omlx/ds4_head_bits`.
+Confirm it engaged:
 
 ```sh
 grep omlx.ds4 ~/.omlx/logs/server.log

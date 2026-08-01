@@ -131,6 +131,24 @@ def _block_size() -> int:
         return 3
 
 
+def _draft_width(trained: int) -> int:
+    """How many tokens the drafter is asked to produce.
+
+    Deliberately separate from `_block_size()`, which is how many of them we
+    actually verify. The drafter's block is non-causal -- every draft position
+    attends to every other -- so its width is part of its input distribution,
+    not a free knob. Running it at its trained `dspark_block_size` and then
+    verifying a prefix keeps it in distribution while keeping the verify narrow
+    enough that the PoolingCache rollback never refuses.
+
+    DS4_SPEC_DRAFT_WIDTH overrides; default is the checkpoint's trained width.
+    """
+    try:
+        return max(1, int(os.environ.get("DS4_SPEC_DRAFT_WIDTH", trained)))
+    except ValueError:
+        return trained
+
+
 def _get_drafter(model) -> Optional[Any]:
     """Build the DSpark drafter once, lazily, from the model's own directory."""
     global _DRAFTER, _DRAFTER_FAILED
@@ -165,11 +183,12 @@ def _get_drafter(model) -> Optional[Any]:
         drafter.load_weights(list(weights.items()), strict=True)
         mx.eval(drafter.parameters())
         del weights
-        drafter.block_size = _block_size()
+        drafter.block_size = _draft_width(dspark["dspark_block_size"])
         _DRAFTER = drafter
         _log(
             f"DSpark drafter loaded ({dspark['n_mtp_layers']} stages, "
-            f"block_size={drafter.block_size})"
+            f"draft_width={drafter.block_size}, "
+            f"verify_width={min(_block_size(), drafter.block_size)})"
         )
     except Exception as e:  # noqa: BLE001
         _DRAFTER_FAILED = True
@@ -451,6 +470,52 @@ def _apply_hidden_capture(n_last: int = 3) -> None:
     cls._ds4_hidden_patched = True
 
 
+def _maybe_quantize_head(model) -> None:
+    """Optionally quantize `lm_head` in place after load. Off by default.
+
+    The checkpoint deliberately leaves `head` unquantized (`config.json` has
+    `"head": false`), so it is 129280 x 4096 in bf16 = **1.06 GB read per
+    forward** -- about 10% of everything a decode step moves, and speculation
+    reads it TWICE per cycle (once in the drafter, once in the verify), so ~17%
+    of the cycle's bytes.
+
+    Quantizing it to 8-bit halves that. It is not free: the logits change
+    slightly, which can flip an argmax on a near-tie. Opt-in, and the bit width
+    is explicit:
+
+        DS4_QUANT_HEAD=8    # or 6, or 4
+    """
+    bits = os.environ.get("DS4_QUANT_HEAD")
+    if not bits:
+        # File fallback: oMLX is launched from the GUI, which inherits no shell
+        # environment.  echo 8 > ~/.omlx/ds4_head_bits
+        marker = Path.home() / ".omlx" / "ds4_head_bits"
+        if marker.exists():
+            bits = marker.read_text().strip()
+    if not bits:
+        return
+    try:
+        bits = int(bits)
+        import mlx.nn as nn
+
+        head = getattr(model, "lm_head", None)
+        if head is None or isinstance(head, nn.QuantizedLinear):
+            return
+        before = head.weight.size * head.weight.dtype.size
+        model.lm_head = nn.QuantizedLinear.from_linear(head, group_size=64, bits=bits)
+        after = sum(
+            v.size * v.dtype.size
+            for v in (model.lm_head.weight, model.lm_head.scales, model.lm_head.biases)
+        )
+        mx.eval(model.lm_head.parameters())
+        _log(
+            f"lm_head quantized to {bits}-bit: "
+            f"{before / 1e9:.2f} GB -> {after / 1e9:.2f} GB per read"
+        )
+    except Exception as e:  # noqa: BLE001
+        _log(f"lm_head quantization skipped: {type(e).__name__}: {e}")
+
+
 def _apply_path_capture() -> None:
     """Record each model's directory so the drafter can find its `mtp.*` weights."""
     import mlx_lm.utils as _utils
@@ -465,6 +530,7 @@ def _apply_path_capture() -> None:
             model._ds4_model_path = str(model_path)
         except Exception:  # noqa: BLE001
             pass
+        _maybe_quantize_head(model)
         return model, config
 
     wrapped._ds4_path_wrapped = True
@@ -545,7 +611,11 @@ def apply() -> bool:
 def _cycle(self, drafter):
     """One draft -> verify -> accept -> rollback cycle. Returns the first token."""
     model = self.model
-    k = drafter.block_size
+    # k is the VERIFY width -- how many drafts we check and may commit.
+    # drafter.block_size is the DRAFT width, kept at the trained value so the
+    # non-causal draft block stays in distribution. They are decoupled on
+    # purpose; see `_draft_width`.
+    k = min(_block_size(), drafter.block_size)
     cache = self.prompt_cache
 
     # Everything that can fail must happen BEFORE the verify forward: once the
@@ -585,7 +655,9 @@ def _cycle(self, drafter):
         pos,
     )
     mx.eval(draft_ids)
-    drafts = [int(x) for x in draft_ids[0].tolist()]
+    # The drafter may have produced more than we intend to verify (see
+    # `_draft_width`); verify a prefix of them.
+    drafts = [int(x) for x in draft_ids[0].tolist()][:k]
 
     # Verify [t, d1..dk] in one forward, with oMLX's undo log armed.
     #
