@@ -1,5 +1,24 @@
 # DeepSeek-V4-Flash-0731 MXFP4 — fast on Apple Silicon
 
+> ## ⚠️ oMLX 0.5.4rc2 and later: do NOT enable this recipe's speculation
+>
+> **oMLX 0.5.4rc2 ships native DSpark Lightning MTP** with Metal kernels for the
+> DSpark projections, routed experts, DSA indexer scoring and block verification.
+> On rc2 the model already speculates natively (per-model `mtp_enabled`).
+>
+> If you also set `~/.omlx/ds4_spec_enabled` from this recipe, **two independent
+> speculative decoders draft and roll back the same KV cache**. It does not
+> crash — it produces fluent-looking corruption, with the model restarting the
+> same sentence over and over in slightly different words. Verified on rc2.
+>
+> On rc2+, remove the marker (`rm ~/.omlx/ds4_spec_enabled`) and use upstream's
+> native MTP. The rest of this recipe's history is kept below as a record of how
+> the checkpoint and the measurements were produced.
+>
+> Note that native MTP requires a checkpoint with the embedded `dspark_*`
+> weights. `mlx-community/DeepSeek-V4-Flash-4bit` has them stripped (zero
+> `mtp.*` tensors); the MXFP4 checkpoint this repo documents keeps them.
+
 Fixes and speed patches for running
 [**Vontra/DeepSeek-V4-Flash-0731-MXFP4-MLX**](https://huggingface.co/Vontra/DeepSeek-V4-Flash-0731-MXFP4-MLX)
 (305B total / 13B active) under [oMLX](https://omlx.app) on a Mac.
