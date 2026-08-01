@@ -68,8 +68,18 @@ materialisation. Measured by slope through the API:
 
 | | spec off | production stack |
 |---|---|---|
-| 23K cached context | 26.1 | **40.7 tok/s** (+56%) |
-| short prompt | ~29 | **50.1 tok/s** |
+| 23K cached context | 26.1 | **37.6 – 40.7 tok/s** |
+| short prompt | ~29 | **47.7 – 50.1 tok/s** |
+
+Ranges, not points, because machine state moves them. The high figures were
+measured ~15 minutes after a reboot; re-measuring the identical configuration
+after a further eight model load/unload cycles gave 37.6 and 47.7. All
+production markers were verified present immediately before both runs, so this
+is not configuration drift. The most likely cause is sustained-load/thermal
+state — this machine degraded roughly 4x mid-session during development and
+recovered only after a reboot — but that has not been proven with a cold
+re-measure, so both numbers are published and the cause is left open. Quote
+the low end if you need a figure you can rely on.
 
 Phase attribution: short 55.5 ms/cycle vs 23K 63.1 — **97% of the context cost
 is the target forward's attention** (indexer top-512 over long context +
