@@ -35,16 +35,43 @@ the stock path. Off unless DS4_SPEC=1.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
 import mlx.core as mx
 
 _PATCHED = False
-_DRAFTER: Optional[Any] = None
 _DRAFTER_FAILED = False
+_METAL_LABELER = None
+_METAL_RECORDER = None
+_METAL_STATE = threading.local()
+
+
+def set_metal_profiler(labeler, recorder) -> None:
+    """Install test-only command-buffer labels and per-cycle host records."""
+    global _METAL_LABELER, _METAL_RECORDER
+    _METAL_LABELER = labeler
+    _METAL_RECORDER = recorder
+
+
+def _metal_label(value: str) -> None:
+    if _METAL_LABELER is not None:
+        _METAL_LABELER(value)
+
+
+def _metal_phase(value: str) -> None:
+    _METAL_STATE.phase = value
+    _metal_label(value)
+
+
+def _metal_record(value: dict) -> None:
+    if _METAL_RECORDER is not None:
+        _METAL_RECORDER(value)
 
 
 class _NotReady(Exception):
@@ -52,23 +79,149 @@ class _NotReady(Exception):
 
 
 # Cycle accounting, so a disappointing speedup can be attributed: low draft
-# acceptance is a different problem from rollback clamping it away.
-STATS = {"cycles": 0, "raw_accepted": 0, "clamped_accepted": 0, "clamp_hits": 0,
-         "restore_replay": 0}
+# acceptance is a different problem from rollback clamping it away. Timings are
+# opt-in because even the clock reads should not be in the normal hot path.
+# They surround mx.eval calls that already exist, so enabling them adds no GPU
+# synchronization and preserves the shape of the workload being measured.
+STATS = {
+    "cycles": 0,
+    "raw_accepted": 0,
+    "clamped_accepted": 0,
+    "clamp_hits": 0,
+    "cache_clamp_hits": 0,
+    "stop_clamp_hits": 0,
+    "restore_replay": 0,
+    "timed_cycles": 0,
+    "draft_s": 0.0,
+    "snapshot_s": 0.0,
+    "verify_sample_s": 0.0,
+    "commit_s": 0.0,
+    # Commit sub-phases (attack #1: split the ~9 ms partial-rollback host gap).
+    "commit_clamp_s": 0.0,
+    "commit_roll_s": 0.0,
+    "commit_consist_s": 0.0,
+    "commit_emit_s": 0.0,
+    "commit_window_s": 0.0,
+    "partial_timed_cycles": 0,
+    "partial_commit_s": 0.0,
+    "cycle_s": 0.0,
+    "verify_width_counts": [0] * 9,
+    "verify_width_timed": [0] * 9,
+    "verify_width_s": [0.0] * 9,
+    "verify_width_accepted": [0] * 9,
+    "confidence_survival_sum": [0.0] * 8,
+    "confidence_survival_count": [0] * 8,
+    "actual_survival_count": [0] * 8,
+}
 
 
 def stats_summary() -> str:
     c = STATS["cycles"]
     if not c:
         return "no speculative cycles"
-    return (
+    summary = (
         f"cycles={c} "
         f"raw_accept={STATS['raw_accepted'] / c:.2f} "
         f"after_clamp={STATS['clamped_accepted'] / c:.2f} "
         f"tokens/cycle={(STATS['clamped_accepted'] + c) / c:.2f} "
         f"clamped_on={STATS['clamp_hits'] / c * 100:.0f}% "
+        f"cache_clamped_on={STATS['cache_clamp_hits'] / c * 100:.0f}% "
+        f"stop_clamped_on={STATS['stop_clamp_hits'] / c * 100:.0f}% "
         f"restore_replay={STATS['restore_replay'] / c * 100:.0f}%"
     )
+    tc = STATS["timed_cycles"]
+    if tc:
+        summary += (
+            " | ms/cycle "
+            f"draft={STATS['draft_s'] / tc * 1000:.2f} "
+            f"snapshot={STATS['snapshot_s'] / tc * 1000:.2f} "
+            f"verify+sample={STATS['verify_sample_s'] / tc * 1000:.2f} "
+            f"commit={STATS['commit_s'] / tc * 1000:.2f} "
+            f"[clamp={STATS['commit_clamp_s'] / tc * 1000:.2f} "
+            f"roll={STATS['commit_roll_s'] / tc * 1000:.2f} "
+            f"consist={STATS['commit_consist_s'] / tc * 1000:.2f} "
+            f"emit={STATS['commit_emit_s'] / tc * 1000:.2f} "
+            f"window={STATS['commit_window_s'] / tc * 1000:.2f}] "
+            f"partial_commit={0 if not STATS['partial_timed_cycles'] else STATS['partial_commit_s'] / STATS['partial_timed_cycles'] * 1000:.2f}x{STATS['partial_timed_cycles']} "
+            f"total={STATS['cycle_s'] / tc * 1000:.2f}"
+        )
+    widths = []
+    for width, count in enumerate(STATS["verify_width_counts"]):
+        if not count:
+            continue
+        accepted = STATS["verify_width_accepted"][width] / count
+        timing_count = STATS["verify_width_timed"][width]
+        latency = (
+            f"/{STATS['verify_width_s'][width] / timing_count * 1000:.1f}ms"
+            if timing_count
+            else ""
+        )
+        widths.append(f"{width}:{count}@{accepted:.2f}{latency}")
+    if widths:
+        summary += " | widths=" + ",".join(widths)
+    calibration = []
+    for i, count in enumerate(STATS["confidence_survival_count"]):
+        if not count:
+            continue
+        predicted = STATS["confidence_survival_sum"][i] / count
+        observed = STATS["actual_survival_count"][i] / count
+        calibration.append(f"p{i + 1}={predicted:.2f}/{observed:.2f}")
+    if calibration:
+        summary += " | pred/actual=" + ",".join(calibration)
+    return summary
+
+
+def _report_every() -> int:
+    """Optional cumulative server-log interval, in speculative cycles."""
+    try:
+        configured = os.environ.get("DS4_SPEC_REPORT_EVERY")
+        if configured is not None:
+            return max(0, int(configured))
+        # The GUI-launched server does not inherit shell variables.  Creating
+        # the timing marker should therefore make the instrumentation useful on
+        # its own rather than silently collecting data that is never reported.
+        if (Path.home() / ".omlx" / "ds4_spec_timing").exists():
+            return 25
+        return 0
+    except ValueError:
+        return 0
+
+
+def _timing_enabled() -> bool:
+    value = os.environ.get("DS4_SPEC_TIMING")
+    if value is not None:
+        return value == "1"
+    return (Path.home() / ".omlx" / "ds4_spec_timing").exists()
+
+
+def _profile_sync_enabled() -> bool:
+    """Test-only phase isolation with a real Metal barrier after drafting.
+
+    Normal timing intentionally preserves draft/verify overlap, so its draft
+    number is only host enqueue time and verify includes the pending drafter.
+    This mode sacrifices throughput to attribute GPU work correctly. It must
+    never be enabled as a production optimization.
+    """
+    value = os.environ.get("DS4_SPEC_PROFILE_SYNC")
+    if value is not None:
+        return value == "1"
+    return (Path.home() / ".omlx" / "ds4_spec_profile_sync").exists()
+
+
+def _maybe_reset_stats() -> None:
+    """Consume the profiling reset marker without restarting the server."""
+    marker = Path.home() / ".omlx" / "ds4_spec_reset_stats"
+    if not marker.exists():
+        return
+    for key, value in STATS.items():
+        if isinstance(value, list):
+            value[:] = [0] * len(value)
+        elif isinstance(value, float):
+            STATS[key] = 0.0
+        else:
+            STATS[key] = 0
+    marker.unlink(missing_ok=True)
+    _log("speculative profiling counters reset")
 
 
 _logger = logging.getLogger("omlx.ds4")
@@ -125,8 +278,16 @@ def _block_size() -> int:
        costs a full restore plus a replay forward. At k=5 that is a fifth of all
        cycles.
     """
+    value = os.environ.get("DS4_SPEC_BLOCK")
+    if value is None:
+        marker = Path.home() / ".omlx" / "ds4_block_size"
+        if marker.exists():
+            try:
+                value = marker.read_text().strip()
+            except OSError:
+                value = None
     try:
-        return int(os.environ.get("DS4_SPEC_BLOCK", "3"))
+        return max(0, min(7, int(value if value is not None else "3")))
     except ValueError:
         return 3
 
@@ -143,17 +304,138 @@ def _draft_width(trained: int) -> int:
 
     DS4_SPEC_DRAFT_WIDTH overrides; default is the checkpoint's trained width.
     """
+    # Measured at 23K cached context, verify width 3, correct rollback:
+    #     draft_width 3 -> 35.0   5 -> 35.0   7 -> 38.2 tok/s
+    # Wider drafting than we verify raises acceptance: the drafter sees more of
+    # its own block, and we only commit a prefix. 7 beat the checkpoint's
+    # trained width of 5, so the default is 7 rather than `trained`.
+    default = 7
+    value = os.environ.get("DS4_SPEC_DRAFT_WIDTH")
+    if value is None:
+        marker = Path.home() / ".omlx" / "ds4_draft_width"
+        if marker.exists():
+            try:
+                value = marker.read_text().strip()
+            except OSError:
+                value = None
     try:
-        return max(1, int(os.environ.get("DS4_SPEC_DRAFT_WIDTH", trained)))
+        return max(1, min(8, int(value if value is not None else default)))
     except ValueError:
-        return trained
+        return default
+
+
+_SCHEDULE_LOADED = False
+_SCHEDULE_CONFIG: Optional[dict] = None
+
+
+def _schedule_config() -> Optional[dict]:
+    """Load the profiled single-request DSpark cost curve once per process.
+
+    The scheduler is intentionally inactive without an explicit profile.  A
+    CUDA SPS table would be wrong for Metal, and even old measurements become
+    stale when a kernel changes.  The GUI-friendly file format is:
+
+        ~/.omlx/ds4_schedule.json
+        {
+          "verify_ms": [ms_for_1_token, ..., ms_for_8_tokens],
+          "fixed_ms": draft_and_commit_overhead,
+          "temperatures": [optional STS temperature per draft position],
+          "max_drafts": optional safety cap
+        }
+
+    ``verify_ms[k]`` is the target-forward latency for physical input length
+    k+1, i.e. anchor plus k draft tokens.
+    """
+    global _SCHEDULE_LOADED, _SCHEDULE_CONFIG
+    if _SCHEDULE_LOADED:
+        return _SCHEDULE_CONFIG
+    _SCHEDULE_LOADED = True
+
+    path_value = os.environ.get("DS4_SPEC_SCHEDULE")
+    if path_value is not None and path_value.strip().lower() in ("", "0", "off"):
+        return None
+    path = Path(path_value) if path_value else Path.home() / ".omlx" / "ds4_schedule.json"
+    if not path.exists():
+        return None
+    try:
+        import json
+
+        config = json.loads(path.read_text())
+        verify_ms = [float(value) for value in config["verify_ms"]]
+        if not verify_ms or any(value <= 0 for value in verify_ms):
+            raise ValueError("verify_ms must contain positive values")
+        fixed_ms = max(0.0, float(config.get("fixed_ms", 0.0)))
+        temperatures = [
+            max(1e-4, float(value)) for value in config.get("temperatures", [])
+        ]
+        _SCHEDULE_CONFIG = {
+            "verify_ms": verify_ms,
+            "fixed_ms": fixed_ms,
+            "temperatures": temperatures,
+            "max_drafts": max(
+                0, int(config.get("max_drafts", len(verify_ms) - 1))
+            ),
+        }
+        _log(
+            "confidence scheduler enabled from profiled Metal curve "
+            f"({len(verify_ms)} widths, fixed={fixed_ms:.2f}ms)"
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log(f"confidence scheduler ignored: {type(exc).__name__}: {exc}")
+        _SCHEDULE_CONFIG = None
+    return _SCHEDULE_CONFIG
+
+
+def _confidence_probabilities(raw: list[float], config: Optional[dict]) -> list[float]:
+    temperatures = config.get("temperatures", []) if config else []
+    out = []
+    for i, value in enumerate(raw):
+        temperature = temperatures[i] if i < len(temperatures) else 1.0
+        z = max(-30.0, min(30.0, value / temperature))
+        out.append(1.0 / (1.0 + math.exp(-z)))
+    return out
+
+
+def _scheduled_width(raw: list[float], maximum: int) -> tuple[int, list[float]]:
+    """Select the prefix maximizing expected output tokens per millisecond.
+
+    For one request, expected emitted tokens at width k are
+    ``1 + sum_j prod_{i<=j} confidence_i``.  The denominator is the measured
+    fixed draft/commit cost plus the measured target pass for physical width
+    k+1.  This is Algorithm 1 from the DSpark paper specialized to R=1.
+    """
+    config = _schedule_config()
+    probabilities = _confidence_probabilities(raw, config)
+    if config is None:
+        return maximum, probabilities
+
+    verify_ms = config["verify_ms"]
+    maximum = min(maximum, len(verify_ms) - 1, len(probabilities))
+    fixed_ms = config["fixed_ms"]
+    expected = 1.0
+    survival = 1.0
+    best_width = 0
+    best_rate = expected / (fixed_ms + verify_ms[0])
+    # Early stopping is both the paper's causal rule and the correct choice for
+    # the smooth single-request curves we profile on this Studio.
+    for width in range(1, maximum + 1):
+        survival *= probabilities[width - 1]
+        expected += survival
+        rate = expected / (fixed_ms + verify_ms[width])
+        if rate > best_rate:
+            best_rate = rate
+            best_width = width
+        else:
+            break
+    return best_width, probabilities
 
 
 def _get_drafter(model) -> Optional[Any]:
     """Build the DSpark drafter once, lazily, from the model's own directory."""
-    global _DRAFTER, _DRAFTER_FAILED
-    if _DRAFTER is not None or _DRAFTER_FAILED:
-        return _DRAFTER
+    global _DRAFTER_FAILED
+    existing = getattr(model, "_ds4_drafter", None)
+    if existing is not None or _DRAFTER_FAILED:
+        return existing
 
     path = getattr(model, "_ds4_model_path", None)
     if path is None:
@@ -184,7 +466,11 @@ def _get_drafter(model) -> Optional[Any]:
         mx.eval(drafter.parameters())
         del weights
         drafter.block_size = _draft_width(dspark["dspark_block_size"])
-        _DRAFTER = drafter
+        # Ownership belongs to the loaded model, not this module. A module-level
+        # strong reference kept the 10 GiB drafter alive after oMLX unloaded the
+        # target, defeating emergency memory reclaim and making the next load an
+        # OOM risk. Model unload now releases target and drafter together.
+        model._ds4_drafter = drafter
         _log(
             f"DSpark drafter loaded ({dspark['n_mtp_layers']} stages, "
             f"draft_width={drafter.block_size}, "
@@ -193,12 +479,49 @@ def _get_drafter(model) -> Optional[Any]:
     except Exception as e:  # noqa: BLE001
         _DRAFTER_FAILED = True
         _log(f"DSpark drafter NOT loaded: {type(e).__name__}: {e}")
-    return _DRAFTER
+    return getattr(model, "_ds4_drafter", None)
 
 
 _REPORTED = set()
 _EXPECT_WARNED = False
 _DISAGREE_DETAILED = False
+
+
+def _limit_accept_for_terminal(gb, anchor: int, drafts: list[int], accepted: int) -> int:
+    """Do not commit queued tokens beyond a terminal state-machine match.
+
+    ``GenerationBatch.next()`` advances the matcher only when each queued token
+    is returned to the caller.  The KV cache, however, is committed for the
+    whole accepted prefix inside this cycle.  If a stop token occurs in the
+    middle of that prefix, ``next()`` immediately extracts the cache at the
+    stop and any later committed draft would make it longer than ``all_tokens``.
+
+    Simulate the exact immutable matcher transition from the live request state
+    over ``[anchor, accepted drafts]`` and retain the stop token itself, but no
+    token after it.  The live matcher is deliberately not changed here; the
+    ordinary response path will advance it once per emitted token as usual.
+    """
+    if accepted <= 0:
+        return 0
+    machines = getattr(gb, "state_machines", None) or []
+    states = getattr(gb, "_matcher_states", None) or []
+    if not machines or not states:
+        return accepted
+
+    machine = machines[0]
+    state = states[0]
+    for index, token in enumerate([anchor, *drafts[:accepted]]):
+        state, match_sequence, current_state = machine.match(state, int(token))
+        if match_sequence is not None and current_state is None:
+            # index 0 is the anchor (zero drafts); index N is draft N.
+            return min(accepted, index)
+    return accepted
+
+
+def _cap_verify_for_request(gb, maximum_k: int) -> int:
+    """Cap drafts so cache commitment cannot pass the request token limit."""
+    remaining = int(gb.max_tokens[0]) - int(gb._num_tokens[0])
+    return min(maximum_k, max(0, remaining - 1))
 
 
 def _eligible(gb) -> bool:
@@ -271,18 +594,54 @@ def _offsets_consistent(cache, expected: int) -> bool:
     Real corruption is layers of the *same* class drifting apart, which is what
     a failed rollback produces. That is what this now tests.
     """
+    # One eval, not one per cache. `BatchRotatingKVCache.offset` is an
+    # mx.array; right after a trim each holds a fresh lazy `offset - n` node,
+    # so calling `.item()` per cache forces up to ~41 separate host-device
+    # round trips. Concatenating them and materialising once turns that into a
+    # single sync. Marker-gated for A/B: absent -> original per-item path.
+    batched = (Path.home() / ".omlx" / "ds4_consist_batched").exists()
+
     by_cls: dict = {}
-    for layer_cache in cache:
-        for c in _unwrap(layer_cache):
-            name = type(c).__name__
-            if not name.endswith("RotatingKVCache"):
-                continue
-            o = c.offset
+    if batched:
+        names, arrs, ints = [], [], []
+        for layer_cache in cache:
+            for c in _unwrap(layer_cache):
+                name = type(c).__name__
+                if not name.endswith("RotatingKVCache"):
+                    continue
+                o = c.offset
+                if isinstance(o, mx.array):
+                    names.append(name)
+                    arrs.append(o.reshape(-1)[:1])
+                else:
+                    try:
+                        ints.append((name, int(o)))
+                    except Exception:  # noqa: BLE001
+                        pass
+        if arrs:
             try:
-                o = int(o.item() if hasattr(o, "item") else o)
+                values = mx.concatenate(arrs).tolist()  # ONE sync
             except Exception:  # noqa: BLE001
-                continue
-            by_cls.setdefault(name, set()).add(o)
+                values = []
+                names = []
+        else:
+            values = []
+        for name, value in zip(names, values):
+            by_cls.setdefault(name, set()).add(int(value))
+        for name, value in ints:
+            by_cls.setdefault(name, set()).add(value)
+    else:
+        for layer_cache in cache:
+            for c in _unwrap(layer_cache):
+                name = type(c).__name__
+                if not name.endswith("RotatingKVCache"):
+                    continue
+                o = c.offset
+                try:
+                    o = int(o.item() if hasattr(o, "item") else o)
+                except Exception:  # noqa: BLE001
+                    continue
+                by_cls.setdefault(name, set()).add(o)
 
     for name, offsets in by_cls.items():
         if len(offsets) > 1:
@@ -394,19 +753,21 @@ def _can_trim(c, n: int) -> bool:
     return False
 
 
-def clamp_accept(cache, accepted: int, num_drafts: int) -> int:
+def clamp_accept(cache, accepted: int, num_drafts: int) -> Optional[int]:
     """Largest m <= accepted whose rollback every layer supports.
 
     Emitting fewer verified drafts than acceptance allowed is always correct --
     the skipped ones are re-derived next cycle -- so this keeps the cycle alive
-    when a PoolingCache cannot replay a longer confirmed prefix.
+    when a PoolingCache cannot replay a longer confirmed prefix. ``None`` means
+    no accepted prefix is directly trimmable; the caller must undo the complete
+    verify update and replay the accepted prefix instead.
     """
     entries = [c for layer_cache in cache for c in _unwrap(layer_cache)]
     for m in range(accepted, -1, -1):
         n = num_drafts - m
         if n <= 0 or all(_can_trim(c, n) for c in entries):
             return m
-    return 0
+    return None
 
 
 def partial_rollback(cache, accepted: int, num_drafts: int) -> bool:
@@ -435,6 +796,48 @@ def partial_rollback(cache, accepted: int, num_drafts: int) -> bool:
         return False
     for c in entries:
         if c.trim(n) != n:
+            return False
+    return True
+
+
+def _builtin_verify_undo_supported(cache) -> bool:
+    """Does every concrete cache carry a complete one-update verify undo?
+
+    Current oMLX PoolingCaches save ``_undo`` for updates up to eight tokens,
+    while its rotating-cache patch saves ``_mtp_undo`` when the verifier is
+    armed. In that known layout a full pre-verify snapshot merely duplicates
+    the cache-owned transaction logs. Unknown cache types stay on the generic
+    snapshot path so a future oMLX layout cannot silently weaken correctness.
+    """
+    entries = [c for layer_cache in cache for c in _unwrap(layer_cache)]
+    if not entries:
+        return False
+    for c in entries:
+        if getattr(c, "remainder", None) is not None:
+            if not hasattr(c, "_undo") or not callable(getattr(c, "_can_undo", None)):
+                return False
+            continue
+        if type(c).__name__.endswith("RotatingKVCache"):
+            if not getattr(type(c), "_omlx_mtp_undo_attached", False):
+                return False
+            continue
+        return False
+    return True
+
+
+def _undo_verify(cache, verify_tokens: int) -> bool:
+    """Undo the complete armed verify update on every concrete cache.
+
+    Unlike a partial rollback this never needs to reconstruct a completed pool
+    window: replay length is zero. It is therefore the safe boundary fallback
+    when no ``m <= accepted`` is directly trimmable. The caller then replays
+    only ``[t, accepted drafts]`` through the target model.
+    """
+    entries = [c for layer_cache in cache for c in _unwrap(layer_cache)]
+    if not entries or not all(_can_trim(c, verify_tokens) for c in entries):
+        return False
+    for c in entries:
+        if c.trim(verify_tokens) != verify_tokens:
             return False
     return True
 
@@ -514,7 +917,7 @@ def _rollback(cache, n: int) -> bool:
 
 
 def _apply_hidden_capture(n_last: int = 3) -> None:
-    """Make DeepseekV4Model stash the hidden states DSpark fuses.
+    """Make DeepseekV4Model stash hidden states and stage layer graphs.
 
     The reference takes `h.mean(dim=2)` (the mean over the hc_mult
     Hyper-Connection copies) at each of `dspark_target_layer_ids` and
@@ -537,18 +940,31 @@ def _apply_hidden_capture(n_last: int = 3) -> None:
     # (return_hidden, n_confirmed) than stock. Apply this AFTER that patch so we
     # wrap it rather than replace it.
     def __call__(self, inputs, *args, **kwargs):
+        from ds4 import layer_async
+
         targets = set(
             range(self.args.num_hidden_layers - n_last, self.args.num_hidden_layers)
         )
+        fire_after = layer_async.boundaries(inputs.shape[1], len(self.layers))
         captured = []
         layer_cls = type(self.layers[0])
         inner = layer_cls.__call__
         index_of = {id(layer): i for i, layer in enumerate(self.layers)}
+        staged_from = 0
 
         def wrapper(layer_self, *a, **kw):
+            nonlocal staged_from
             out = inner(layer_self, *a, **kw)
-            if index_of.get(id(layer_self)) in targets:
+            index = index_of.get(id(layer_self))
+            if index in targets:
                 captured.append(out.mean(axis=2))
+            if index in fire_after:
+                phase = getattr(_METAL_STATE, "phase", "model")
+                _metal_label(
+                    f"{phase}/layers_{staged_from:02d}_{index:02d}"
+                )
+                mx.async_eval(out)
+                staged_from = index + 1
             return out
 
         layer_cls.__call__ = wrapper
@@ -642,6 +1058,14 @@ def _apply_path_capture() -> None:
             model._ds4_model_path = str(model_path)
         except Exception:  # noqa: BLE001
             pass
+        # oMLX may re-register the DeepSeek-V4 module during model load, so
+        # reapply the opt-in cache patch here before the first forward.
+        try:
+            from ds4 import cache_async
+
+            cache_async.apply()
+        except Exception as exc:  # noqa: BLE001
+            _log(f"async cache patch skipped: {type(exc).__name__}: {exc}")
         _maybe_quantize_head(model)
         return model, config
 
@@ -724,11 +1148,29 @@ def _cycle(self, drafter):
     """One draft -> verify -> accept -> rollback cycle. Returns the first token."""
     global _DRAFTER_FAILED
     model = self.model
-    # k is the VERIFY width -- how many drafts we check and may commit.
+    # maximum_k is the VERIFY budget -- the confidence scheduler may choose a
+    # shorter prefix after the drafter has produced its fixed-width block.
     # drafter.block_size is the DRAFT width, kept at the trained value so the
     # non-causal draft block stays in distribution. They are decoupled on
     # purpose; see `_draft_width`.
-    k = min(_block_size(), drafter.block_size)
+    schedule = _schedule_config()
+    if schedule is None:
+        maximum_k = min(_block_size(), drafter.block_size)
+    else:
+        maximum_k = min(
+            schedule["max_drafts"], len(schedule["verify_ms"]) - 1,
+            drafter.block_size,
+        )
+
+    # GenerationBatch increments _num_tokens only after _step returns.  Limit
+    # the accepted queue to what the request can still emit, otherwise a final
+    # speculative cycle can commit tokens past max_tokens.  oMLX then extracts
+    # that too-long cache under the shorter visible token list, contaminating
+    # future prefix-cache hits.  Falling back at one token remaining is safe
+    # because _NotReady is raised before any model/drafter call.
+    maximum_k = _cap_verify_for_request(self, maximum_k)
+    if maximum_k == 0:
+        raise _NotReady("final request token must use the stock step")
     cache = self.prompt_cache
 
     # Everything that can fail must happen BEFORE the verify forward: once the
@@ -738,8 +1180,15 @@ def _cycle(self, drafter):
     if tok_arr is None or not self._next_logprobs:
         raise _NotReady("pipeline not primed yet")
     lp_prev = self._next_logprobs[0]
-    mx.eval(tok_arr)
-    t = int(tok_arr[0])
+    profile_sync = _profile_sync_enabled()
+    timing = _timing_enabled() or profile_sync
+    if timing:
+        _maybe_reset_stats()
+    cycle_number = STATS["cycles"] + 1
+    cycle_prefix = f"cycle/{cycle_number:04d}"
+    _metal_phase(f"{cycle_prefix}/draft/build")
+    cycle_started = time.perf_counter() if timing else 0.0
+    draft_started = cycle_started
 
     offset = int(cache[0][0].offset if isinstance(cache[0], (list, tuple)) else cache[0].offset)
     pos = offset - 1  # absolute position of the last token already in the cache
@@ -760,17 +1209,44 @@ def _cycle(self, drafter):
         if os.environ.get("DS4_SPEC_DEBUG") == "1":
             _log(f"window seeded with {mh.shape[1]} positions from offset {start}")
 
-    draft_ids, _conf = drafter(
-        mx.array([[t]]),
+    draft_ids, raw_confidence = drafter(
+        tok_arr.reshape(1, 1),
         model.model.embed_tokens,
         model.lm_head,
         window,
         pos,
     )
-    mx.eval(draft_ids)
-    # The drafter may have produced more than we intend to verify (see
-    # `_draft_width`); verify a prefix of them.
-    drafts = [int(x) for x in draft_ids[0].tolist()][:k]
+    if profile_sync:
+        # Attribute the drafter's queued Metal work to the draft phase instead
+        # of the target's first blocking eval. Production deliberately omits
+        # this barrier so both graphs can share one command-buffer pipeline.
+        _metal_phase(f"{cycle_prefix}/draft/eval")
+        mx.eval(draft_ids, raw_confidence)
+    drafts = None
+    raw_confidence_values = None
+    if schedule is None:
+        # Keep draft -> target entirely on the GPU.  Pulling draft_ids to the
+        # host just to rebuild this array introduced a hard command-buffer
+        # boundary between the two largest pieces of every cycle.  The fixed
+        # width is shape-known, so the target can consume the lazy draft array
+        # directly and all host-visible values resolve at the post-verify sync.
+        k = maximum_k
+        cand_arr = mx.concatenate(
+            [tok_arr.reshape(1, 1), draft_ids[:, :k].astype(tok_arr.dtype)],
+            axis=1,
+        )
+        confidence_probabilities = None
+    else:
+        # The optional confidence scheduler makes a genuinely data-dependent
+        # shape choice, so this mode alone retains the mid-cycle sync.
+        mx.eval(draft_ids, raw_confidence)
+        raw_confidence_values = [float(x) for x in raw_confidence[0].tolist()]
+        k, confidence_probabilities = _scheduled_width(
+            raw_confidence_values, maximum_k
+        )
+        drafts = [int(x) for x in draft_ids[0].tolist()][:k]
+        cand_arr = mx.array([[int(tok_arr[0])] + drafts])
+    draft_finished = time.perf_counter() if timing else 0.0
 
     # Verify [t, d1..dk] in one forward, with oMLX's undo log armed.
     #
@@ -779,70 +1255,130 @@ def _cycle(self, drafter):
     # which is the trap I fell into rolling my own) for any armed update of
     # 2..8 tokens, and makes trim() replay the confirmed prefix from it. It is
     # only armed around a verify forward, so stock decode keeps stock semantics.
-    # Snapshot before the forward. `mtp_clamp_accept` can return an accepted
-    # count that `mtp_partial_rollback` then refuses, and by that point the
-    # verify has already advanced the cache -- which is what turns output into
-    # repetition. This gives an unconditional way back.
-    # The snapshot exists only for the case where `partial_rollback` refuses
-    # after the verify. At k<=3 that has never fired in measurement (clamped 0%,
-    # restore 0%), yet we pay ~105 caches x several attributes of graph-node
-    # construction every cycle for it. DS4_NO_SNAPSHOT=1 skips it to measure the
-    # cost; if rollback then refuses we have no way back, so speculation
-    # disables itself rather than decode against a corrupt cache.
-    # Snapshotting every cycle costs ~11% of decode (105 caches x several
-    # attributes of graph-node construction) and only pays off if
-    # `partial_rollback` refuses -- which has never fired at k<=3 in
-    # measurement. Default is to skip it and rely on the cheap offset tripwire
-    # after rollback instead. DS4_SNAPSHOT=1 restores the belt-and-braces path.
-    # Snapshot by default. Skipping it measured ~11% faster (32.5 -> 36.2 tok/s
-    # at 23K), but the offset tripwire below then caught real cache desync, so
-    # that speed is not safely available: `partial_rollback` refusing after the
-    # verify leaves layers at different lengths and there is no way back without
-    # this. DS4_NO_SNAPSHOT=1 re-enables the fast path for measurement only.
-    snaps = None if os.environ.get("DS4_NO_SNAPSHOT") == "1" else _snapshot(cache)
+    # Current oMLX caches already snapshot the same verify update in `_undo` /
+    # `_mtp_undo`. Duplicating every array in all ~105 concrete caches here cost
+    # ~11% of decode (32.5 -> 36.2 tok/s at 23K). Use the built-in transaction
+    # logs for the known layout; keep the generic snapshot for an unfamiliar
+    # cache type and as an explicit diagnostic override.
+    snapshot_started = time.perf_counter() if timing else 0.0
+    needs_snapshot = (
+        os.environ.get("DS4_FORCE_SNAPSHOT") == "1"
+        or not _builtin_verify_undo_supported(cache)
+    )
+    snaps = _snapshot(cache) if needs_snapshot else None
     _check_offsets(cache, offset, "pre-verify")
+    snapshot_finished = time.perf_counter() if timing else 0.0
+    verify_started = snapshot_finished
 
+    _metal_phase(f"{cycle_prefix}/verify/target")
     _set_armed(True)
     try:
-        logits = model(cand_arr := mx.array([[t] + drafts]), cache=cache)[0]
+        logits = model(cand_arr, cache=cache)[0]
     finally:
         _set_armed(False)
     del cand_arr
+    _metal_phase(f"{cycle_prefix}/verify/tail_sample")
     logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
     sampler = (self.samplers and self.samplers[0]) or self.fallback_sampler
-    samples = [int(sampler(logprobs[i : i + 1])[0]) for i in range(k + 1)]
-    mx.eval(logprobs)
+    if float(getattr(sampler, "temp", -1.0) or 0.0) == 0.0:
+        # oMLX's temp=0 sampler is exactly argmax. One batched reduction is
+        # cheaper than k+1 callable invocations and has identical semantics.
+        target_ids = mx.argmax(logits, axis=-1).astype(mx.int32)
+        mx.eval(logprobs, target_ids, draft_ids, raw_confidence, tok_arr)
+        samples = [int(value) for value in target_ids.tolist()]
+    else:
+        # Preserve stochastic sampler call/RNG order while resolving every row
+        # at the same barrier.
+        sample_arrays = [sampler(logprobs[i : i + 1]) for i in range(k + 1)]
+        mx.eval(
+            logprobs,
+            *sample_arrays,
+            draft_ids,
+            raw_confidence,
+            tok_arr,
+        )
+        samples = [int(sample[0]) for sample in sample_arrays]
+    t = int(tok_arr[0])
+    if drafts is None:
+        drafts = [int(x) for x in draft_ids[0].tolist()][:k]
+    if raw_confidence_values is None:
+        raw_confidence_values = [float(x) for x in raw_confidence[0].tolist()]
+    if confidence_probabilities is None:
+        confidence_probabilities = _confidence_probabilities(
+            raw_confidence_values, None
+        )
+    verify_finished = time.perf_counter() if timing else 0.0
 
     # Longest prefix where the target's own sample reproduces the draft.
     n = 0
     while n < k and samples[n] == drafts[n]:
         n += 1
 
+    # Clamp at an actual terminal transition rather than disabling speculation
+    # for every ordinary chat/EOS state machine.  This must happen before cache
+    # rollback feasibility is chosen because it changes the committed prefix.
+    n_raw = n
+    n_stop = _limit_accept_for_terminal(self, t, drafts, n_raw)
+
     # Not every accepted length is rollback-able: a PoolingCache can only replay
     # a confirmed prefix that stays inside its window. `mtp_clamp_accept` finds
     # the largest m <= n that every layer can undo. Emitting fewer drafts than
     # were verified is always correct -- the rest are re-derived next cycle.
-    n_raw = n
-    n = int(clamp_accept(cache, n, k))
+    clamp_started = time.perf_counter() if timing else 0.0
+    feasible = clamp_accept(cache, n_stop, k)
+    clamp_finished = time.perf_counter() if timing else 0.0
+    replay_from_start = feasible is None
+    n = n_stop if replay_from_start else int(feasible)
     STATS["cycles"] += 1
     STATS["raw_accepted"] += n_raw
     STATS["clamped_accepted"] += n
     STATS["clamp_hits"] += int(n != n_raw)
+    STATS["cache_clamp_hits"] += int(n != n_stop)
+    STATS["stop_clamp_hits"] += int(n_stop != n_raw)
+    STATS["verify_width_counts"][k] += 1
+    STATS["verify_width_accepted"][k] += n_raw
+    _metal_phase(f"{cycle_prefix}/commit/cache")
+    predicted_survival = 1.0
+    for i in range(k):
+        predicted_survival *= confidence_probabilities[i]
+        STATS["confidence_survival_sum"][i] += predicted_survival
+        STATS["confidence_survival_count"][i] += 1
+        STATS["actual_survival_count"][i] += int(n_raw > i)
 
-    if n != n_raw and STATS["clamp_hits"] == 1:
-        # Leading indicator of the unsafe regime: once the clamp starts firing,
-        # `mtp_partial_rollback` can still refuse the value the clamp returned,
-        # and that refusal lands AFTER the verify forward -- rejected drafts
-        # stay in the cache and output degenerates into repetition. Measured
-        # clean at block_size <= 3; garbled at 7.
+    if n_stop != n_raw and STATS["stop_clamp_hits"] == 1:
         _log(
-            f"clamp fired (accept {n_raw}->{n}, block_size={k}). Output is only "
-            "verified clean where the clamp never fires; lower DS4_SPEC_BLOCK "
-            "if you see repetition."
+            f"terminal match clamped accepted prefix {n_raw}->{n_stop}; "
+            "the stop token remains committed and no queued token follows it"
         )
 
-    if not partial_rollback(cache, n, k):
+    if n != n_stop and STATS["cache_clamp_hits"] == 1:
+        # Correctness is unchanged: skipped accepted drafts are re-derived next
+        # cycle. This is a throughput signal that the verify width is crossing
+        # pool boundaries often enough to waste target work.
+        _log(
+            f"pooling-cache clamp fired (accept {n_stop}->{n}, block_size={k}); "
+            "correctness is "
+            "preserved, but a lower DS4_SPEC_BLOCK may be faster"
+        )
+
+    roll_started = time.perf_counter() if timing else 0.0
+    if replay_from_start:
+        # Ratio-4 PoolingCache can hit a phase where every m <= n_raw would
+        # replay across a pool boundary. Its one-update log can still undo the
+        # entire verify (zero-token replay), after which a normal target forward
+        # commits the accepted prefix exactly. This replaces the old every-cycle
+        # full snapshot with work only on the rare boundary cycle.
+        STATS["restore_replay"] += 1
+        if not _undo_verify(cache, k + 1):
+            if snaps is None:
+                _DRAFTER_FAILED = True
+                _log("complete verify undo refused; speculation disabled")
+                raise RuntimeError("complete verify undo refused")
+            _restore(snaps)
+        _check_offsets(cache, offset, "full-undo")
+        model(mx.array([[t] + drafts[:n]]), cache=cache)
+    elif not partial_rollback(cache, n, k):
         # Refused (possibly after partially trimming some layers). Restore the
         # pre-verify state wholesale and re-run only the accepted tokens. The
         # restore overwrites whatever the partial trim did, and the replay is
@@ -850,11 +1386,13 @@ def _cycle(self, drafter):
         STATS["restore_replay"] += 1
         if snaps is None:
             _DRAFTER_FAILED = True
-            _log("rollback refused and no snapshot taken; speculation disabled")
-            raise RuntimeError("rollback refused with DS4_NO_SNAPSHOT=1")
+            _log("rollback contradicted its pre-check; speculation disabled")
+            raise RuntimeError("rollback contradicted its pre-check")
         _restore(snaps)
         _check_offsets(cache, offset, "restore")
         model(mx.array([[t] + drafts[:n]]), cache=cache)
+
+    roll_finished = time.perf_counter() if timing else 0.0
 
     # Emitted: t (already fed) then the n accepted drafts. `_next_tokens`
     # becomes the target's sample at the first unaccepted position.
@@ -873,18 +1411,91 @@ def _cycle(self, drafter):
     # where a plain decode would, 16/16, on both RotatingKVCache and
     # BatchRotatingKVCache, so the mismatch was in the computed `expected`, not
     # the caches. Log it and keep going; DS4_SPEC_STRICT=1 restores the abort.
-    if not _offsets_consistent(cache, offset + n + 1):
+    consist_started = time.perf_counter() if timing else 0.0
+    consistent = _offsets_consistent(cache, offset + n + 1)
+    consist_finished = time.perf_counter() if timing else 0.0
+    if not consistent:
         if os.environ.get("DS4_SPEC_STRICT") == "1":
             _DRAFTER_FAILED = True
             _log("layers disagree on offset -- speculation disabled (STRICT)")
             raise RuntimeError("speculative rollback left caches inconsistent")
 
+    emit_finished = time.perf_counter() if timing else 0.0
     mh = model.model.main_hidden[:, : n + 1]
-    for j in range(n + 1):
-        pos += 1
-        window = drafter.push_window(window, mh[:, j : j + 1], pos)
+    # `push_window` accepts a whole [offset, offset + S) sequence.  Calling it
+    # once per committed token rereads the 3D->D main projection (about 100 MB)
+    # and launches each stage's KV projection n+1 times.  The target verify has
+    # already produced these hidden states as one sequence, so commit them the
+    # same way: one fused projection and one KV projection per stage.  RoPE's
+    # offset is the first position, exactly matching the old loop's first
+    # `pos += 1`; concatenation and final window truncation are equivalent.
+    window = drafter.push_window(window, mh, pos + 1)
+    pos += n + 1
     self._ds4_window = window
-    mx.eval(window, self._next_tokens)
+
+    # The verify result above is the cycle's one unavoidable host barrier: the
+    # accepted-prefix length controls cache rollback. Materialising the draft
+    # window here added a second barrier even though no host value depends on
+    # it. Queue it asynchronously instead; accepted tokens are emitted while
+    # Metal prepares the next cycle, and MLX's dependency graph still makes a
+    # following drafter call wait for the completed window. Keep the blocking
+    # form only when timing is explicitly enabled so phase measurements remain
+    # honest.
+    if timing:
+        _metal_phase(f"{cycle_prefix}/commit/window_eval")
+        mx.eval(window, self._next_tokens)
+    else:
+        _metal_phase(f"{cycle_prefix}/commit/window_async")
+        mx.async_eval(window, self._next_tokens)
+
+    if timing:
+        cycle_finished = time.perf_counter()
+        STATS["timed_cycles"] += 1
+        STATS["draft_s"] += draft_finished - draft_started
+        STATS["snapshot_s"] += snapshot_finished - snapshot_started
+        STATS["verify_sample_s"] += verify_finished - verify_started
+        STATS["commit_s"] += cycle_finished - verify_finished
+        STATS["commit_clamp_s"] += clamp_finished - clamp_started
+        STATS["commit_roll_s"] += roll_finished - roll_started
+        STATS["commit_consist_s"] += consist_finished - consist_started
+        STATS["commit_emit_s"] += emit_finished - consist_finished
+        STATS["commit_window_s"] += cycle_finished - emit_finished
+        if n < k:
+            STATS["partial_timed_cycles"] += 1
+            STATS["partial_commit_s"] += cycle_finished - verify_finished
+        STATS["cycle_s"] += cycle_finished - cycle_started
+        STATS["verify_width_timed"][k] += 1
+        STATS["verify_width_s"][k] += cycle_finished - cycle_started
+        _metal_record(
+            {
+                "cycle": cycle_number,
+                # On macOS perf_counter() and Metal's GPUStartTime/GPUEndTime
+                # share the mach-absolute clock domain. Persist both ends so a
+                # report can reject command buffers that were labelled during
+                # a cycle but actually belong to later request cleanup.
+                "host_start_s": cycle_started,
+                "host_end_s": cycle_finished,
+                "verify_width": k,
+                "raw_accepted": n_raw,
+                "committed_drafts": n,
+                "draft_ms": (draft_finished - draft_started) * 1000,
+                "snapshot_ms": (snapshot_finished - snapshot_started) * 1000,
+                "verify_sample_ms": (verify_finished - verify_started) * 1000,
+                "commit_ms": (cycle_finished - verify_finished) * 1000,
+                "total_ms": (cycle_finished - cycle_started) * 1000,
+                "active_gib": mx.get_active_memory() / 2**30,
+                "peak_gib": mx.get_peak_memory() / 2**30,
+            }
+        )
+
+    report_every = _report_every()
+    if report_every and STATS["cycles"] % report_every == 0:
+        _log(stats_summary())
+
+    # Labels are sampled when a command buffer is committed. Do not leave the
+    # last cycle's label live: response finalisation, prefix-cache extraction,
+    # or an unrelated request would otherwise be charged to that cycle.
+    _metal_phase("server/outside_cycle")
 
     self._ds4_queue = emitted[1:]
     first_tok, first_lp = emitted[0]

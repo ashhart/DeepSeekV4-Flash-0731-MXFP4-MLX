@@ -62,16 +62,40 @@ tokens) went from ~59s to **~6.9s**.
 
 ### Decode
 
-Measured by *slope* (generate N1 and N2 tokens from the same prompt, take
-`(N2-N1)/(t2-t1)`) so prefill and per-request overhead cancel:
+**2026-08-01 production stack** — speculation + batched rollback bookkeeping +
+fused router + 8-bit `lm_head` + fused Q/KV norm/RoPE + async cache
+materialisation. Measured by slope through the API:
 
-| | speculation off | **speculation on** |
+| | spec off | production stack |
 |---|---|---|
-| 23K cached context | 26.2 tok/s | **35.0 tok/s** (1.34x) |
-| short prompt | — | **40.6 tok/s** |
+| 23K cached context | 26.1 | **40.7 tok/s** (+56%) |
+| short prompt | ~29 | **50.1 tok/s** |
 
-Both with the 8-bit `lm_head` below. A decode step moves ~10.1 GB of weights
-against 819 GB/s, so **~81 tok/s is the hard non-speculative ceiling** here.
+Phase attribution: short 55.5 ms/cycle vs 23K 63.1 — **97% of the context cost
+is the target forward's attention** (indexer top-512 over long context +
+pooled-KV reads); the drafter is context-immune by design. Next levers for long
+context: the sparse-attention/indexer path, then a fused L=4 MoE.
+
+#### Determinism (read before comparing hashes)
+
+Temp-0 warm runs are **not bit-reproducible** here, and an exhaustive ladder
+(every feature isolated and in production combination, degraded and healthy
+machines, byte-reverting recent edits) found no configuration that is. The
+divergence matches the documented 1-ULP × top-k amplification; the source sits
+below the application. Gate: same-class cache offset-integrity (zero tolerance)
++ logit tolerance in the measured envelope + output-quality sweeps. Everything
+exactness-testable in isolation passes: rollback 16/16, router sets 244/244,
+GPU-accept 244/244.
+
+#### Fused router (`ds4/router_fused.py`)
+
+One Metal kernel replaces sqrtsoftplus→bias→argpartition(256)→gather→normalize.
+Unit-proven 244/244; **measured in-pipeline −1.2 ms/cycle** — far below the
+isolated ledger's 5.13 ms, which mostly overlaps away in the real pipeline.
+Promoted: consistent, zero-risk. Harness lesson: levers must prove ENGAGEMENT
+in-log or the A/B voids itself. `ds4/gpu_accept.py` (244/244) ships shelved —
+the engine already single-barriers per-cycle readbacks, so its projected win
+evaporated on reading the code it targeted.
 
 #### For comparison: dual DGX Spark
 

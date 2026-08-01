@@ -34,6 +34,54 @@ def _install_patches(module) -> None:
     def wrapped(*args, **kwargs):
         result = original(*args, **kwargs)
         try:
+            from ds4 import metal_probe
+
+            if metal_probe.apply():
+                _log("lightweight Metal command-buffer profiler enabled")
+        except Exception as e:  # noqa: BLE001 -- never break model loading
+            _log(f"Metal command-buffer profiler NOT applied: {type(e).__name__}: {e}")
+
+        try:
+            from ds4 import decode_moe
+
+            if decode_moe.apply():
+                _log("one-token wide MXFP4 routed-MoE kernel enabled")
+        except Exception as e:  # noqa: BLE001 -- never break model loading
+            _log(f"decode MoE kernel NOT applied: {type(e).__name__}: {e}")
+
+        try:
+            from ds4 import pooling_rollback
+
+            if pooling_rollback.apply():
+                _log("prefix-preserving DSpark pooling rollback enabled")
+        except Exception as e:  # noqa: BLE001 -- never break model loading
+            _log(f"pooling rollback NOT applied: {type(e).__name__}: {e}")
+
+        try:
+            from ds4 import qkv_rope
+
+            if qkv_rope.apply():
+                _log("fused V4 Q/KV RMSNorm+RoPE enabled")
+        except Exception as e:  # noqa: BLE001 -- never break model loading
+            _log(f"Q/KV norm+RoPE fusion NOT applied: {type(e).__name__}: {e}")
+
+        try:
+            from ds4 import router_fused
+
+            if router_fused.apply():
+                _log("fused MoE router installed (marker ds4_router_fused)")
+        except Exception as e:  # noqa: BLE001 -- never break model loading
+            _log(f"fused router NOT installed: {type(e).__name__}: {e}")
+
+        try:
+            from ds4 import cache_async
+
+            if cache_async.apply():
+                _log("asynchronous DeepSeek-V4 cache materialization enabled")
+        except Exception as e:  # noqa: BLE001 -- never break model loading
+            _log(f"async cache materialization NOT applied: {type(e).__name__}: {e}")
+
+        try:
             from ds4 import windowed_prefill
 
             if windowed_prefill.apply():
@@ -47,10 +95,13 @@ def _install_patches(module) -> None:
 
         try:
             from ds4 import engine_hook
+            from ds4 import layer_async
 
             if engine_hook.apply():
                 state = "ON" if engine_hook.enabled() else "off (set DS4_SPEC=1)"
                 _log(f"DSpark speculative decoding hook installed, {state}")
+            if layer_async.describe() != "off":
+                _log(f"layer async scheduling enabled ({layer_async.describe()})")
         except Exception as e:  # noqa: BLE001
             _log(f"DSpark hook NOT installed: {type(e).__name__}: {e}")
         return result

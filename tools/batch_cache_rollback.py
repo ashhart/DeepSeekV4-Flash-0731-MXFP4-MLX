@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+import studio_guard
+
 HEAD_DIM = 8
 MAX = 128
 
@@ -79,6 +81,7 @@ def run_case(cls, name, prefill_len, decodes, k, n, armed):
 
 
 def main() -> int:
+    studio_guard.assert_safe(required_free_gib=24.0)
     from mlx_lm.models import cache as cache_mod
 
     classes = [
