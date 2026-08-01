@@ -76,6 +76,39 @@ is the target forward's attention** (indexer top-512 over long context +
 pooled-KV reads); the drafter is context-immune by design. Next levers for long
 context: the sparse-attention/indexer path, then a fused L=4 MoE.
 
+#### Where every millisecond goes (measured, 2026-08-01)
+
+The decode cycle is linear in verify width. Two independent methods agree on
+the intercept (a width sweep, and a Metal command-buffer ledger):
+
+```
+cycle = 42.4 ms base + 6.95 ms x verify_width        (23K context, k=3 optimal)
+
+base = MoE 19.4 | attention 15.7 | hyper-connections 6.8 | indexer 4.7 ms
+```
+
+Against a weight roofline the base should be ~7.9 ms, so the forward runs at
+roughly **19% of bandwidth** — and it is not bandwidth-limited, it is launch
+limited. Hyper-connections are the extreme case: ~22 MB moved, 6.8 ms spent,
+about **0.4% of roofline**, across ~344 kernel launches per cycle.
+
+#### Negative results (do not re-dig these)
+
+Published because they cost real time and the reasoning is reusable:
+
+| Attempt | Result |
+| --- | --- |
+| Un-gate native indexer kernels at decode by padding L to 64 | **−10.5 ms/cycle.** 16x query waste beats the generic fallback's cost |
+| Decode-shaped fused indexer scores kernel (float-exact, 4/4) | **−1.4 ms/cycle.** A hand-rolled scalar loop loses to MLX's Steel GEMM |
+| Verify width 4 and 5 | Slower. ~7 ms per extra position, no acceptance gain |
+| Draft width 8 | Null vs 7 |
+| `layer_async` on/off | Null. `async_eval` splits command buffers without blocking |
+| Hyper-connection pre-ops under one `mx.compile` | Null. MLX will not collapse those launches for free |
+
+Two of these targeted the indexer on the theory that a long-context term lived
+there. It does not: per-layer cost is uniform and mostly context-independent.
+Attribution before kernels, always.
+
 #### Determinism (read before comparing hashes)
 
 Temp-0 warm runs are **not bit-reproducible** here, and an exhaustive ladder

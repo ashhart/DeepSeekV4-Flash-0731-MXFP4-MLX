@@ -74,6 +74,38 @@ def _install_patches(module) -> None:
             _log(f"fused router NOT installed: {type(e).__name__}: {e}")
 
         try:
+            from ds4 import indexer_pad
+
+            if indexer_pad.apply():
+                _log("indexer pad-to-shape installed (marker ds4_indexer_pad)")
+        except Exception as e:  # noqa: BLE001 -- never break model loading
+            _log(f"indexer pad NOT installed: {type(e).__name__}: {e}")
+
+        try:
+            from ds4 import indexer_decode
+
+            if indexer_decode.apply():
+                _log("decode-shaped fused indexer installed (marker ds4_indexer_decode)")
+        except Exception as e:  # noqa: BLE001 -- never break model loading
+            _log(f"decode indexer NOT installed: {type(e).__name__}: {e}")
+
+        try:
+            from ds4 import module_probe
+
+            if module_probe.apply():
+                _log("module probe installed (marker ds4_module_probe, diagnostic)")
+        except Exception as e:  # noqa: BLE001 -- never break model loading
+            _log(f"module probe NOT installed: {type(e).__name__}: {e}")
+
+        try:
+            from ds4 import hc_fuse
+
+            if hc_fuse.apply():
+                _log("hyper-connection pre-op fusion installed (marker ds4_hc_fuse)")
+        except Exception as e:  # noqa: BLE001 -- never break model loading
+            _log(f"hc fuse NOT installed: {type(e).__name__}: {e}")
+
+        try:
             from ds4 import cache_async
 
             if cache_async.apply():
